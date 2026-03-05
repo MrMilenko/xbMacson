@@ -1,0 +1,6 @@
+{
+  "default_ip": "192.168.0.121",
+  "auto_reconnect": true,
+  "log_dir": "",
+  "last_connected": []
+}

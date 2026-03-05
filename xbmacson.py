@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+"""
+xbMacson - Cross-platform Xbox Debug Monitor (TUI)
+Connects to XBDM (Xbox Debug Monitor) on port 731
+and streams debug output from OutputDebugString/DbgPrint.
+
+No flags needed — everything is interactive.
+Config stored at ~/.xbmacson.json
+"""
+
+import curses
+import socket
+import sys
+import time
+import re
+import os
+import json
+import threading
+import queue
+import concurrent.futures
+
+XBDM_PORT = 731
+RECV_BUFSIZE = 4096
+RECONNECT_DELAY = 3
+CONFIG_PATH = os.path.expanduser("~/.xbmacson.json")
+MAX_LOG_LINES = 10000
+
+DEBUGSTR_RE = re.compile(
+    r'^debugstr\s+thread=(\d+)\s+(cr|lf)\s+string=(.*)', re.DOTALL
+)
+
+# Color pair IDs
+C_NORMAL = 0
+C_RED = 1
+C_GREEN = 2
+C_YELLOW = 3
+C_CYAN = 4
+C_MAGENTA = 5
+C_DIM = 6
+C_BOLD_CYAN = 7
+C_STATUS = 8
+C_HEADER = 9
+C_INPUT = 10
+C_SELECTED = 11
+
+
+# ── Config ───────────────────────────────────────────────────────────────
+
+def load_config():
+    defaults = {
+        "default_ip": "",
+        "auto_reconnect": True,
+        "log_dir": "",
+        "last_connected": [],
+    }
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+            defaults.update(cfg)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return defaults
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+# ── XBDM Protocol ───────────────────────────────────────────────────────
+
+def parse_debug_line(line):
+    m = DEBUGSTR_RE.match(line)
+    if m:
+        return (m.group(1), m.group(3))
+    return None
+
+
+def classify_line(text):
+    lower = text.lower()
+    if any(w in lower for w in ["error", "fail", "assert", "crash"]):
+        return C_RED
+    if any(w in lower for w in ["warn", "invalid", "not found"]):
+        return C_YELLOW
+    if any(w in lower for w in ["init", "start", "loaded", "success", "connected"]):
+        return C_GREEN
+    if text.startswith("[") and "]" in text:
+        return C_CYAN
+    return C_NORMAL
+
+
+def get_local_subnet():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        parts = local_ip.split(".")
+        return local_ip, f"{parts[0]}.{parts[1]}.{parts[2]}"
+    except Exception:
+        return None, None
+
+
+def check_xbdm_host(ip):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        if s.connect_ex((ip, XBDM_PORT)) == 0:
+            try:
+                greeting = s.recv(256).decode("utf-8", errors="replace").strip()
+                if greeting.startswith("201"):
+                    s.sendall(b"DBGNAME\r\n")
+                    resp = s.recv(256).decode("utf-8", errors="replace").strip()
+                    name = resp.replace("200- ", "") if resp.startswith("200") else "unknown"
+                    s.close()
+                    return (ip, name)
+            except Exception:
+                s.close()
+                return (ip, "unknown")
+        s.close()
+    except Exception:
+        pass
+    return None
+
+
+# ── Data Types ───────────────────────────────────────────────────────────
+
+class LogLine:
+    __slots__ = ("ts", "thread_id", "text", "color", "is_system")
+
+    def __init__(self, ts, thread_id, text, color, is_system=False):
+        self.ts = ts
+        self.thread_id = thread_id
+        self.text = text
+        self.color = color
+        self.is_system = is_system
+
+
+# ── XBDM Connection (background thread) ─────────────────────────────────
+
+class XBDMConnection:
+    def __init__(self, msg_queue):
+        self.msg_queue = msg_queue
+        self.sock = None
+        self.thread = None
+        self.running = False
+        self.connected = False
+        self.xbox_name = ""
+        self.xbox_ip = ""
+        self.dm_version = ""
+
+    def connect(self, ip):
+        self.xbox_ip = ip
+        self.running = True
+        self.connected = False
+        self.xbox_name = ""
+        self.dm_version = ""
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def disconnect(self):
+        self.running = False
+        self.connected = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def _emit(self, text, color=C_NORMAL, is_system=False, thread_id=None):
+        self.msg_queue.put(
+            LogLine(time.strftime("%H:%M:%S"), thread_id, text, color, is_system)
+        )
+
+    def _run(self):
+        while self.running:
+            try:
+                self._emit(
+                    f"Connecting to {self.xbox_ip}:{XBDM_PORT}...",
+                    C_CYAN, is_system=True,
+                )
+
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(10)
+                self.sock.connect((self.xbox_ip, XBDM_PORT))
+
+                greeting = self.sock.recv(RECV_BUFSIZE).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+
+                if not greeting.startswith("201"):
+                    self._emit(f"Bad greeting: {greeting}", C_RED, is_system=True)
+                    self.running = False
+                    return
+
+                # Get debug name
+                try:
+                    self.sock.sendall(b"DBGNAME\r\n")
+                    resp = self.sock.recv(RECV_BUFSIZE).decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    if resp.startswith("200"):
+                        self.xbox_name = resp.replace("200- ", "")
+                except Exception:
+                    pass
+
+                # Get DM version
+                try:
+                    self.sock.sendall(b"DMVERSION\r\n")
+                    resp = self.sock.recv(RECV_BUFSIZE).decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    if resp.startswith("200"):
+                        self.dm_version = resp.replace("200- ", "")
+                except Exception:
+                    pass
+
+                # Subscribe to debug strings
+                self.sock.sendall(b"NOTIFY debugstr\r\n")
+                self.sock.recv(RECV_BUFSIZE)  # consume response
+
+                self.connected = True
+                name_part = f" ({self.xbox_name})" if self.xbox_name else ""
+                self._emit(
+                    f"Connected to {self.xbox_ip}{name_part}",
+                    C_GREEN, is_system=True,
+                )
+
+                self.sock.settimeout(None)
+
+                buffer = ""
+                while self.running:
+                    data = self.sock.recv(RECV_BUFSIZE)
+                    if not data:
+                        self._emit(
+                            "Connection closed by Xbox", C_RED, is_system=True
+                        )
+                        break
+
+                    buffer += data.decode("utf-8", errors="replace")
+
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.rstrip("\r")
+                        if not line:
+                            continue
+
+                        parsed = parse_debug_line(line)
+                        if parsed:
+                            tid, msg = parsed
+                            if not msg.strip():
+                                continue
+                            self._emit(msg, classify_line(msg), thread_id=tid)
+                        else:
+                            self._emit(line, classify_line(line), is_system=True)
+
+            except socket.timeout:
+                self._emit("Connection timed out", C_RED, is_system=True)
+            except ConnectionRefusedError:
+                self._emit(
+                    "Connection refused — is XBDM running?", C_RED, is_system=True
+                )
+            except ConnectionResetError:
+                self._emit("Connection reset by Xbox", C_RED, is_system=True)
+            except OSError as e:
+                if self.running:
+                    self._emit(f"Socket error: {e}", C_RED, is_system=True)
+            finally:
+                self.connected = False
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+
+            if not self.running:
+                break
+
+            self._emit(
+                f"Reconnecting in {RECONNECT_DELAY}s...", C_YELLOW, is_system=True
+            )
+            for _ in range(RECONNECT_DELAY * 10):
+                if not self.running:
+                    return
+                time.sleep(0.1)
+
+
+# ── TUI Application ─────────────────────────────────────────────────────
+
+class XbMacsonTUI:
+    # Modes
+    MENU = "menu"
+    SCAN = "scan"
+    MONITOR = "monitor"
+    TEXT_INPUT = "text_input"
+    FILTER_INPUT = "filter_input"
+    SETTINGS = "settings"
+    PROBE = "probe"
+
+    LOGO = [
+        r"          _     __  __                             ",
+        r"   __  __| |__ |  \/  | __ _  ___ ___  ___  _ __  ",
+        r"   \ \/ /| '_ \| |\/| |/ _` |/ __/ __|/ _ \| '_ \ ",
+        r"    >  < | |_) | |  | | (_| | (__\__ \ (_) | | | |",
+        r"   /_/\_\|_.__/|_|  |_|\__,_|\___|___/\___/|_| |_|",
+    ]
+
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.config = load_config()
+        self.mode = self.MENU
+        self.msg_queue = queue.Queue()
+        self.conn = XBDMConnection(self.msg_queue)
+
+        # Log
+        self.log_lines = []
+        self.scroll_offset = 0
+        self.auto_scroll = True
+        self.line_count = 0
+
+        # Toggles
+        self.filter_str = ""
+        self.raw_mode = False
+        self.paused = False
+        self.log_file = None
+        self.log_filename = ""
+
+        # Scan
+        self.scan_results = []
+        self.scan_running = False
+        self.scan_cursor = 0
+
+        # Probe
+        self.probe_lines = []
+
+        # Generic input
+        self.input_buf = ""
+        self.input_prompt = ""
+        self.input_cb = None
+        self.input_return_mode = self.MENU
+
+        # Menu / settings cursor
+        self.cursor = 0
+        self._menu_opts = []
+
+        self._init_curses()
+
+    def _init_curses(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(C_RED, curses.COLOR_RED, -1)
+        curses.init_pair(C_GREEN, curses.COLOR_GREEN, -1)
+        curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
+        curses.init_pair(C_CYAN, curses.COLOR_CYAN, -1)
+        curses.init_pair(C_MAGENTA, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+        curses.init_pair(C_BOLD_CYAN, curses.COLOR_CYAN, -1)
+        curses.init_pair(C_STATUS, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(C_HEADER, curses.COLOR_BLACK, curses.COLOR_GREEN)
+        curses.init_pair(C_INPUT, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(C_SELECTED, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.curs_set(0)
+        self.scr.nodelay(True)
+        self.scr.keypad(True)
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _size(self):
+        return self.scr.getmaxyx()
+
+    def _header(self, title):
+        h, w = self._size()
+        self.scr.attron(curses.color_pair(C_HEADER) | curses.A_BOLD)
+        self.scr.addnstr(0, 0, " " * w, w)
+        x = max(0, (w - len(title)) // 2)
+        self.scr.addnstr(0, x, title, w - x)
+        self.scr.attroff(curses.color_pair(C_HEADER) | curses.A_BOLD)
+
+    def _status(self, text):
+        h, w = self._size()
+        self.scr.attron(curses.color_pair(C_STATUS))
+        self.scr.addnstr(h - 1, 0, text.ljust(w), w - 1)
+        self.scr.attroff(curses.color_pair(C_STATUS))
+
+    def _center(self, y, text, attr=0):
+        _, w = self._size()
+        x = max(0, (w - len(text)) // 2)
+        self.scr.addnstr(y, x, text, w - x, attr)
+
+    def _addline(self, y, x, text, attr=0, maxw=None):
+        _, w = self._size()
+        if maxw is None:
+            maxw = w - x - 1
+        if maxw > 0 and y < self._size()[0] - 1:
+            self.scr.addnstr(y, x, text, maxw, attr)
+
+    def _visible_lines(self):
+        if not self.filter_str:
+            return self.log_lines
+        filt = self.filter_str.lower()
+        return [ln for ln in self.log_lines if filt in ln.text.lower() or ln.is_system]
+
+    def _drain_queue(self):
+        for _ in range(500):  # batch process
+            try:
+                item = self.msg_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(item, LogLine):
+                continue
+            self.line_count += 1
+            self.log_lines.append(item)
+            if self.log_file and not self.paused:
+                pfx = f"[{item.ts}]"
+                if item.thread_id:
+                    pfx += f" [T{item.thread_id}]"
+                self.log_file.write(f"{pfx} {item.text}\n")
+                self.log_file.flush()
+            if len(self.log_lines) > MAX_LOG_LINES:
+                self.log_lines = self.log_lines[-MAX_LOG_LINES:]
+
+    def _remember_ip(self, ip, name=""):
+        last = self.config.get("last_connected", [])
+        last = [e for e in last if (e[0] if isinstance(e, list) else e) != ip]
+        last.insert(0, [ip, name])
+        self.config["last_connected"] = last[:5]
+        save_config(self.config)
+
+    def _start_monitor(self, ip):
+        self.conn.disconnect()
+        self.log_lines.clear()
+        self.line_count = 0
+        self.scroll_offset = 0
+        self.auto_scroll = True
+        self.mode = self.MONITOR
+        self.conn.connect(ip)
+        self._remember_ip(ip)
+
+    # ── Main Loop ────────────────────────────────────────────────────────
+
+    def run(self):
+        handlers = {
+            self.MENU: (self._draw_menu, self._key_menu),
+            self.SCAN: (self._draw_scan, self._key_scan),
+            self.MONITOR: (self._draw_monitor, self._key_monitor),
+            self.TEXT_INPUT: (self._draw_text_input, self._key_text_input),
+            self.FILTER_INPUT: (self._draw_filter, self._key_filter),
+            self.SETTINGS: (self._draw_settings, self._key_settings),
+            self.PROBE: (self._draw_probe, self._key_probe),
+        }
+        while True:
+            self._drain_queue()
+            draw, handle = handlers[self.mode]
+            draw()
+            if not handle():
+                break
+            time.sleep(0.02)
+
+        self.conn.disconnect()
+        if self.log_file:
+            self.log_file.close()
+
+    # ── Menu ─────────────────────────────────────────────────────────────
+
+    def _build_menu_opts(self):
+        opts = []
+        dip = self.config.get("default_ip", "")
+        if dip:
+            opts.append(("connect", f"Connect to {dip}"))
+
+        last = self.config.get("last_connected", [])
+        for entry in last[:3]:
+            ip = entry[0] if isinstance(entry, list) else entry
+            name = entry[1] if isinstance(entry, list) and len(entry) > 1 else ""
+            if ip == dip:
+                continue
+            label = ip
+            if name:
+                label += f" ({name})"
+            opts.append(("recent:" + ip, f"Recent: {label}"))
+
+        opts.append(("scan", "Scan network for Xbox consoles"))
+        opts.append(("enter", "Enter IP address"))
+        opts.append(("settings", "Settings"))
+        opts.append(("quit", "Quit"))
+        return opts
+
+    def _draw_menu(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header("xbMacson")
+
+        y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, "Cross-platform Xbox Debug Monitor",
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
+        self._menu_opts = self._build_menu_opts()
+        if self.cursor >= len(self._menu_opts):
+            self.cursor = 0
+
+        col = max(2, (w - 52) // 2)
+        for i, (_, desc) in enumerate(self._menu_opts):
+            if y >= h - 2:
+                break
+            if i == self.cursor:
+                attr = curses.color_pair(C_SELECTED) | curses.A_BOLD
+                self._addline(y, col, f" > {desc}".ljust(50), attr, 50)
+            else:
+                self._addline(y, col, f"   {desc}", curses.color_pair(C_CYAN))
+            y += 1
+
+        self._status(" \u2191\u2193 Navigate  Enter Select  Q Quit")
+        self.scr.refresh()
+
+    def _key_menu(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        n = len(self._menu_opts)
+        if key in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % n
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % n
+        elif key in (curses.KEY_ENTER, 10, 13):
+            tag = self._menu_opts[self.cursor][0]
+            if tag == "connect":
+                self._start_monitor(self.config["default_ip"])
+            elif tag.startswith("recent:"):
+                self._start_monitor(tag.split(":", 1)[1])
+            elif tag == "scan":
+                self._begin_scan()
+            elif tag == "enter":
+                self._begin_input("Xbox IP Address: ", self._on_ip_entered, self.MENU)
+            elif tag == "settings":
+                self.mode = self.SETTINGS
+                self.cursor = 0
+            elif tag == "quit":
+                return False
+        elif key in (ord("q"), ord("Q")):
+            return False
+        elif key in (ord("s"), ord("S")):
+            self._begin_scan()
+        return True
+
+    # ── Text Input ───────────────────────────────────────────────────────
+
+    def _begin_input(self, prompt, callback, return_mode):
+        self.input_buf = ""
+        self.input_prompt = prompt
+        self.input_cb = callback
+        self.input_return_mode = return_mode
+        self.mode = self.TEXT_INPUT
+        curses.curs_set(1)
+
+    def _draw_text_input(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header("xbMacson")
+
+        y = h // 2 - 1
+        full = self.input_prompt + self.input_buf
+        col = max(0, (w - len(full) - 5) // 2)
+
+        self._addline(y, col, self.input_prompt, curses.color_pair(C_CYAN))
+        ix = col + len(self.input_prompt)
+        field_w = min(30, w - ix - 2)
+        self._addline(y, ix, self.input_buf.ljust(field_w), curses.color_pair(C_INPUT), field_w)
+
+        cx = ix + len(self.input_buf)
+        if cx < w:
+            self.scr.move(y, cx)
+
+        self._status(" Enter Confirm  Esc Cancel")
+        self.scr.refresh()
+
+    def _key_text_input(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            curses.curs_set(0)
+            self.mode = self.input_return_mode
+        elif key in (curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            if self.input_cb:
+                self.input_cb(self.input_buf)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_buf = self.input_buf[:-1]
+        elif 32 <= key <= 126:
+            self.input_buf += chr(key)
+        return True
+
+    def _on_ip_entered(self, ip):
+        ip = ip.strip()
+        if ip:
+            self._start_monitor(ip)
+        else:
+            self.mode = self.MENU
+
+    # ── Network Scan ─────────────────────────────────────────────────────
+
+    def _begin_scan(self):
+        self.scan_results = []
+        self.scan_running = True
+        self.scan_cursor = 0
+        self.mode = self.SCAN
+        threading.Thread(target=self._scan_thread, daemon=True).start()
+
+    def _scan_thread(self):
+        _, subnet = get_local_subnet()
+        if not subnet:
+            self.scan_running = False
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            futs = {
+                pool.submit(check_xbdm_host, f"{subnet}.{i}"): i
+                for i in range(1, 255)
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                result = fut.result()
+                if result:
+                    self.scan_results.append(result)
+        self.scan_running = False
+
+    def _draw_scan(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header("Network Scan")
+
+        y = 2
+        if self.scan_running:
+            spin = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+            ch = spin[int(time.time() * 10) % len(spin)]
+            self._addline(
+                y, 3, f"{ch} Scanning port {XBDM_PORT} on local subnet...",
+                curses.color_pair(C_CYAN),
+            )
+            y += 1
+            if self.scan_results:
+                self._addline(
+                    y, 3, f"Found {len(self.scan_results)} so far...",
+                    curses.color_pair(C_GREEN),
+                )
+                y += 1
+        else:
+            if self.scan_results:
+                self._addline(
+                    y, 3,
+                    f"Found {len(self.scan_results)} Xbox console(s):",
+                    curses.color_pair(C_GREEN) | curses.A_BOLD,
+                )
+            else:
+                self._addline(
+                    y, 3, "No Xbox consoles found.",
+                    curses.color_pair(C_YELLOW),
+                )
+            y += 1
+
+        y += 1
+        if self.scan_cursor >= len(self.scan_results):
+            self.scan_cursor = 0
+        for i, (ip, name) in enumerate(self.scan_results):
+            if y >= h - 2:
+                break
+            text = f"{ip:<18} {name}"
+            if i == self.scan_cursor:
+                self._addline(y, 3, f"> {text}".ljust(w - 5), curses.color_pair(C_SELECTED) | curses.A_BOLD, w - 5)
+            else:
+                self._addline(y, 3, f"  {text}", curses.color_pair(C_CYAN))
+            y += 1
+
+        status = " Scanning...  Esc Back" if self.scan_running else " \u2191\u2193 Select  Enter Connect  D Set Default  Esc Back"
+        self._status(status)
+        self.scr.refresh()
+
+    def _key_scan(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            self.mode = self.MENU
+            self.cursor = 0
+            return True
+        if not self.scan_results:
+            return True
+        n = len(self.scan_results)
+        if key in (curses.KEY_UP, ord("k")):
+            self.scan_cursor = (self.scan_cursor - 1) % n
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.scan_cursor = (self.scan_cursor + 1) % n
+        elif key in (curses.KEY_ENTER, 10, 13):
+            ip, name = self.scan_results[self.scan_cursor]
+            self._remember_ip(ip, name)
+            self._start_monitor(ip)
+        elif key in (ord("d"), ord("D")):
+            ip, _ = self.scan_results[self.scan_cursor]
+            self.config["default_ip"] = ip
+            save_config(self.config)
+        return True
+
+    # ── Monitor ──────────────────────────────────────────────────────────
+
+    def _draw_monitor(self):
+        self.scr.erase()
+        h, w = self._size()
+
+        # Header
+        if self.conn.connected:
+            title = f"xbMacson \u2014 {self.conn.xbox_name or self.conn.xbox_ip}"
+            if self.conn.xbox_name:
+                title += f" ({self.conn.xbox_ip})"
+            if self.conn.dm_version:
+                title += f" \u2014 XBDM {self.conn.dm_version}"
+        else:
+            title = f"xbMacson \u2014 connecting to {self.conn.xbox_ip}..."
+        self._header(title)
+
+        # Indicator row
+        inds = []
+        if self.filter_str:
+            inds.append(f"FILTER: {self.filter_str}")
+        if self.raw_mode:
+            inds.append("RAW")
+        if self.paused:
+            inds.append("PAUSED")
+        if self.log_file:
+            inds.append(f"LOG: {self.log_filename}")
+        if not self.auto_scroll:
+            inds.append("SCROLL LOCK")
+
+        log_y = 1
+        if inds:
+            self._addline(1, 1, " | ".join(inds), curses.color_pair(C_YELLOW) | curses.A_BOLD)
+            log_y = 2
+
+        # Log area
+        area_h = h - log_y - 1
+        visible = self._visible_lines()
+
+        if self.paused and not visible:
+            pass  # nothing to draw
+
+        if self.auto_scroll:
+            start = max(0, len(visible) - area_h)
+        else:
+            start = max(0, len(visible) - area_h - self.scroll_offset)
+
+        page = visible[start : start + area_h]
+
+        for i, ln in enumerate(page):
+            y = log_y + i
+            if y >= h - 1:
+                break
+
+            # Timestamp
+            ts = f"[{ln.ts}]"
+            if ln.thread_id and not self.raw_mode:
+                pfx = f"{ts} [T{ln.thread_id}] "
+            else:
+                pfx = f"{ts} "
+
+            self._addline(y, 0, pfx, curses.A_DIM)
+
+            mx = len(pfx)
+            rem = w - mx - 1
+            if rem > 0:
+                attr = curses.color_pair(ln.color)
+                if ln.is_system:
+                    attr |= curses.A_BOLD
+                self._addline(y, mx, ln.text, attr, rem)
+
+        # Status bar
+        left = f" Lines: {self.line_count}"
+        if self.filter_str:
+            left += f" | Visible: {len(visible)}"
+
+        connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
+        left = f" {connected_icon} {left.strip()}"
+
+        right = "F:Filter R:Raw L:Log P:Pause C:Clear I:Info D:Default Esc:Menu Q:Quit "
+        pad = w - len(left) - len(right)
+        if pad < 1:
+            bar = left[:w - 1]
+        else:
+            bar = left + " " * pad + right
+        self._status(bar)
+        self.scr.refresh()
+
+    def _key_monitor(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+
+        if key in (ord("q"), ord("Q")):
+            return False
+
+        if key == 27:  # Esc
+            self.conn.disconnect()
+            self.mode = self.MENU
+            self.cursor = 0
+
+        elif key in (ord("f"), ord("F")):
+            self.input_buf = self.filter_str
+            self.mode = self.FILTER_INPUT
+            curses.curs_set(1)
+
+        elif key in (ord("r"), ord("R")):
+            self.raw_mode = not self.raw_mode
+
+        elif key in (ord("p"), ord("P")):
+            self.paused = not self.paused
+
+        elif key in (ord("c"), ord("C")):
+            self.log_lines.clear()
+            self.line_count = 0
+            self.scroll_offset = 0
+            self.auto_scroll = True
+
+        elif key in (ord("l"), ord("L")):
+            self._toggle_log()
+
+        elif key in (ord("i"), ord("I")):
+            self.probe_lines = []
+            self.mode = self.PROBE
+            threading.Thread(target=self._probe_thread, daemon=True).start()
+
+        elif key in (ord("d"), ord("D")):
+            if self.conn.xbox_ip:
+                self.config["default_ip"] = self.conn.xbox_ip
+                save_config(self.config)
+
+        elif key == curses.KEY_UP:
+            self.auto_scroll = False
+            self.scroll_offset += 1
+            mx = max(0, len(self._visible_lines()) - 1)
+            self.scroll_offset = min(self.scroll_offset, mx)
+
+        elif key == curses.KEY_DOWN:
+            self.scroll_offset = max(0, self.scroll_offset - 1)
+            if self.scroll_offset == 0:
+                self.auto_scroll = True
+
+        elif key == curses.KEY_PPAGE:
+            self.auto_scroll = False
+            self.scroll_offset += self._size()[0] - 3
+            mx = max(0, len(self._visible_lines()) - 1)
+            self.scroll_offset = min(self.scroll_offset, mx)
+
+        elif key == curses.KEY_NPAGE:
+            self.scroll_offset -= self._size()[0] - 3
+            if self.scroll_offset <= 0:
+                self.scroll_offset = 0
+                self.auto_scroll = True
+
+        elif key == curses.KEY_HOME:
+            self.auto_scroll = False
+            self.scroll_offset = max(0, len(self._visible_lines()) - 1)
+
+        elif key == curses.KEY_END:
+            self.scroll_offset = 0
+            self.auto_scroll = True
+
+        return True
+
+    def _toggle_log(self):
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+            self.log_filename = ""
+        else:
+            self.log_filename = time.strftime("xbmacson_%Y%m%d_%H%M%S.log")
+            log_dir = self.config.get("log_dir", "")
+            path = os.path.join(log_dir, self.log_filename) if log_dir else self.log_filename
+            try:
+                self.log_file = open(path, "a")
+            except OSError:
+                self.log_file = None
+                self.log_filename = ""
+
+    # ── Filter Input (overlays monitor) ──────────────────────────────────
+
+    def _draw_filter(self):
+        # Draw monitor underneath
+        self._draw_monitor()
+        # Overwrite status bar with filter input
+        h, w = self._size()
+        prompt = " Filter: "
+        line = prompt + self.input_buf
+        self.scr.attron(curses.color_pair(C_INPUT))
+        self.scr.addnstr(h - 1, 0, line.ljust(w), w - 1)
+        self.scr.attroff(curses.color_pair(C_INPUT))
+        cx = len(line)
+        if cx < w:
+            self.scr.move(h - 1, cx)
+        self.scr.refresh()
+
+    def _key_filter(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            curses.curs_set(0)
+            self.mode = self.MONITOR
+        elif key in (curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            self.filter_str = self.input_buf
+            self.mode = self.MONITOR
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_buf = self.input_buf[:-1]
+            self.filter_str = self.input_buf  # live filter
+        elif 32 <= key <= 126:
+            self.input_buf += chr(key)
+            self.filter_str = self.input_buf
+        return True
+
+    # ── Probe ────────────────────────────────────────────────────────────
+
+    def _probe_thread(self):
+        ip = self.conn.xbox_ip
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, XBDM_PORT))
+
+            greeting = sock.recv(RECV_BUFSIZE).decode("utf-8", errors="replace").strip()
+            self.probe_lines.append(f"Greeting:  {greeting}")
+
+            for cmd in [b"DMVERSION\r\n", b"DBGNAME\r\n", b"XBEINFO running\r\n", b"MODULES\r\n"]:
+                try:
+                    sock.sendall(cmd)
+                    resp = sock.recv(RECV_BUFSIZE).decode("utf-8", errors="replace").strip()
+                    label = cmd.decode().strip()
+                    self.probe_lines.append(f"{label:<16} \u2192 {resp}")
+                except Exception:
+                    pass
+
+            sock.close()
+        except Exception as e:
+            self.probe_lines.append(f"Probe failed: {e}")
+
+    def _draw_probe(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header(f"Xbox Info \u2014 {self.conn.xbox_ip}")
+
+        y = 2
+        if not self.probe_lines:
+            self._addline(y, 3, "Probing...", curses.color_pair(C_DIM) | curses.A_DIM)
+        else:
+            for line in self.probe_lines:
+                if y >= h - 2:
+                    break
+                self._addline(y, 3, line, curses.color_pair(C_CYAN))
+                y += 1
+
+        self._status(" Esc Back to monitor")
+        self.scr.refresh()
+
+    def _key_probe(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key in (27, curses.KEY_ENTER, 10, 13):
+            self.mode = self.MONITOR
+        elif key in (ord("q"), ord("Q")):
+            return False
+        return True
+
+    # ── Settings ─────────────────────────────────────────────────────────
+
+    def _draw_settings(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header("Settings")
+
+        dip = self.config.get("default_ip", "") or "(not set)"
+        ldir = self.config.get("log_dir", "") or "(current directory)"
+        ar = "Yes" if self.config.get("auto_reconnect", True) else "No"
+
+        items = [
+            (f"Default Xbox IP:   {dip}",),
+            (f"Log Directory:     {ldir}",),
+            (f"Auto-Reconnect:    {ar}",),
+            ("Clear Recent Consoles",),
+            ("Back",),
+        ]
+
+        if self.cursor >= len(items):
+            self.cursor = 0
+
+        y = 3
+        for i, (text,) in enumerate(items):
+            if y >= h - 2:
+                break
+            if i == self.cursor:
+                self._addline(y, 3, f"> {text}".ljust(w - 5), curses.color_pair(C_SELECTED) | curses.A_BOLD, w - 5)
+            else:
+                self._addline(y, 3, f"  {text}", curses.color_pair(C_CYAN))
+            y += 2
+
+        self._status(" \u2191\u2193 Navigate  Enter Edit/Toggle  Esc Back")
+        self.scr.refresh()
+
+    def _key_settings(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            self.mode = self.MENU
+            self.cursor = 0
+        elif key in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % 5
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % 5
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if self.cursor == 0:  # default IP
+                self.input_buf = self.config.get("default_ip", "")
+                self.input_prompt = "Default Xbox IP: "
+                self.input_cb = self._on_set_ip
+                self.input_return_mode = self.SETTINGS
+                self.mode = self.TEXT_INPUT
+                curses.curs_set(1)
+            elif self.cursor == 1:  # log dir
+                self.input_buf = self.config.get("log_dir", "")
+                self.input_prompt = "Log Directory: "
+                self.input_cb = self._on_set_logdir
+                self.input_return_mode = self.SETTINGS
+                self.mode = self.TEXT_INPUT
+                curses.curs_set(1)
+            elif self.cursor == 2:  # auto-reconnect toggle
+                self.config["auto_reconnect"] = not self.config.get("auto_reconnect", True)
+                save_config(self.config)
+            elif self.cursor == 3:  # clear recent
+                self.config["last_connected"] = []
+                save_config(self.config)
+            elif self.cursor == 4:  # back
+                self.mode = self.MENU
+                self.cursor = 0
+        return True
+
+    def _on_set_ip(self, val):
+        self.config["default_ip"] = val.strip()
+        save_config(self.config)
+        self.mode = self.SETTINGS
+
+    def _on_set_logdir(self, val):
+        self.config["log_dir"] = val.strip()
+        save_config(self.config)
+        self.mode = self.SETTINGS
+
+
+# ── Entry Point ──────────────────────────────────────────────────────────
+
+def main():
+    # Optional: pass IP as single argument for quick-connect
+    quick_ip = None
+    if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
+        quick_ip = sys.argv[1]
+
+    def run(stdscr):
+        app = XbMacsonTUI(stdscr)
+        if quick_ip:
+            app._start_monitor(quick_ip)
+        app.run()
+
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
