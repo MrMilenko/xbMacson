@@ -132,6 +132,110 @@ def check_xbdm_host(ip):
     return None
 
 
+def xbdm_query(ip, command):
+    """One-shot XBDM command. Returns raw response string."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((ip, XBDM_PORT))
+        # Read greeting
+        sock.recv(RECV_BUFSIZE)
+        # Send command
+        sock.sendall(f"{command}\r\n".encode("utf-8"))
+        # Read response, adapting to response type
+        resp = b""
+        while True:
+            try:
+                chunk = sock.recv(RECV_BUFSIZE)
+                if not chunk:
+                    break
+                resp += chunk
+                text = resp.decode("utf-8", errors="replace")
+                first_line = text.split("\r\n", 1)[0] if "\r\n" in text else ""
+                code = first_line[:3] if len(first_line) >= 3 else ""
+                if code.isdigit():
+                    c = int(code)
+                    if c == 202:
+                        # Multiline: ends with \r\n.\r\n
+                        if "\r\n.\r\n" in text:
+                            break
+                    else:
+                        # Single-line (200, 4xx, etc.)
+                        if "\r\n" in text:
+                            break
+                if len(resp) > 65536:
+                    break
+            except socket.timeout:
+                break
+        sock.close()
+        return resp.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def parse_drivelist(resp):
+    """Extract drive letters from DRIVELIST response.
+
+    XBDM returns either a simple letter string (200- CDEFXYZ)
+    or multiline drivename=\"X\" lines (202-).
+    """
+    drives = []
+    # Try multiline drivename="X" format first
+    for m in re.finditer(r'drivename="([^"]+)"', resp):
+        drives.append(m.group(1))
+    if drives:
+        drives.sort()
+        return drives
+    # Fall back: single-line letter string (200- CDEFXYZ)
+    text = resp
+    if text.startswith("200- "):
+        text = text[5:]
+    elif text.startswith("200-"):
+        text = text[4:]
+    text = text.strip()
+    if text:
+        drives = sorted(set(ch.upper() for ch in text if ch.isalpha()))
+    return drives
+
+
+def parse_dirlist(resp):
+    """Parse DIRLIST response into list of dicts with name, size, is_dir."""
+    entries = []
+    for line in resp.split("\n"):
+        line = line.strip()
+        if not line.startswith("name="):
+            continue
+        m = re.search(r'name="([^"]+)"', line)
+        if not m:
+            continue
+        name = m.group(1)
+        is_dir = "directory" in line
+        size = 0
+        if not is_dir:
+            slo = re.search(r'sizelo=0x([0-9a-fA-F]+)', line)
+            shi = re.search(r'sizehi=0x([0-9a-fA-F]+)', line)
+            if slo:
+                size = int(slo.group(1), 16)
+            if shi:
+                size |= int(shi.group(1), 16) << 32
+        entries.append({"name": name, "size": size, "is_dir": is_dir})
+    # Sort: directories first (alpha), then files (alpha)
+    entries.sort(key=lambda e: (0 if e["is_dir"] else 1, e["name"].lower()))
+    return entries
+
+
+def _fmt_size(nbytes):
+    """Return human-readable file size string."""
+    if nbytes < 1024:
+        return f"{nbytes} B"
+    elif nbytes < 1024 * 1024:
+        return f"{nbytes / 1024:.1f} KB"
+    elif nbytes < 1024 * 1024 * 1024:
+        return f"{nbytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{nbytes / (1024 * 1024 * 1024):.1f} GB"
+
+
 # ── PNG Writer ───────────────────────────────────────────────────────────
 
 def _write_png(path, width, height, pitch, framebuffer):
@@ -408,6 +512,8 @@ class XbMacsonTUI:
     SETTINGS = "settings"
     PROBE = "probe"
     CONFIRM = "confirm"
+    DRIVES = "drives"
+    BROWSER = "browser"
 
     LOGO = [
         r"          _     __  __                             ",
@@ -458,6 +564,19 @@ class XbMacsonTUI:
         self.input_prompt = ""
         self.input_cb = None
         self.input_return_mode = self.MENU
+
+        # Drives
+        self.drives = []
+        self.drives_loading = False
+        self.drives_cursor = 0
+        self.drives_return = self.MONITOR
+
+        # Browser
+        self.browser_path = ""
+        self.browser_entries = []
+        self.browser_cursor = 0
+        self.browser_scroll = 0
+        self.browser_loading = False
 
         # Menu / settings cursor
         self.cursor = 0
@@ -570,6 +689,8 @@ class XbMacsonTUI:
             self.SETTINGS: (self._draw_settings, self._key_settings),
             self.PROBE: (self._draw_probe, self._key_probe),
             self.CONFIRM: (self._draw_confirm, self._key_confirm),
+            self.DRIVES: (self._draw_drives, self._key_drives),
+            self.BROWSER: (self._draw_browser, self._key_browser),
         }
         while True:
             self._drain_queue()
@@ -610,6 +731,9 @@ class XbMacsonTUI:
             if name:
                 label += f" ({name})"
             opts.append(("recent:" + ip, f"Recent: {label}"))
+
+        if self.conn.xbox_ip:
+            opts.append(("browse", "Browse filesystem"))
 
         opts.append(("scan", "Scan network for Xbox consoles"))
         opts.append(("enter", "Enter IP address"))
@@ -673,6 +797,8 @@ class XbMacsonTUI:
                 self._start_monitor(self.config["default_ip"])
             elif tag.startswith("recent:"):
                 self._start_monitor(tag.split(":", 1)[1])
+            elif tag == "browse":
+                self._begin_drives(self.MENU)
             elif tag == "scan":
                 self._begin_scan()
             elif tag == "enter":
@@ -955,7 +1081,7 @@ class XbMacsonTUI:
         connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
         left = f" {connected_icon} {left.strip()}"
 
-        right = "S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info X:Reboot D:Default Esc:Menu Q:Quit "
+        right = "B:Browse S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info X:Reboot Esc:Menu Q:Quit "
         pad = w - len(left) - len(right)
         if pad < 1:
             bar = left[:w - 1]
@@ -1015,6 +1141,10 @@ class XbMacsonTUI:
                 self._begin_confirm(
                     "Reboot the Xbox?", self._do_reboot, self.MONITOR
                 )
+
+        elif key in (ord("b"), ord("B")):
+            if self.conn.xbox_ip:
+                self._begin_drives(self.MONITOR)
 
         elif key == curses.KEY_UP:
             self.auto_scroll = False
@@ -1102,7 +1232,9 @@ class XbMacsonTUI:
                     "Reboot command sent - Xbox restarting...",
                     C_YELLOW, is_system=True)
         )
-        self.conn.send_command("REBOOT")
+        ip = self.conn.xbox_ip
+        self.conn.disconnect()
+        xbdm_query(ip, "REBOOT")
 
     # ── Confirm Dialog ───────────────────────────────────────────────────
 
@@ -1337,6 +1469,247 @@ class XbMacsonTUI:
         self.config["log_dir"] = val.strip()
         save_config(self.config)
         self.mode = self.SETTINGS
+
+    # ── Drives Mode ─────────────────────────────────────────────────────
+
+    def _begin_drives(self, return_mode):
+        self.drives = []
+        self.drives_loading = True
+        self.drives_cursor = 0
+        self.drives_return = return_mode
+        self.mode = self.DRIVES
+        threading.Thread(target=self._drives_thread, daemon=True).start()
+
+    def _drives_thread(self):
+        resp = xbdm_query(self.conn.xbox_ip, "DRIVELIST")
+        self.drives = parse_drivelist(resp)
+        self.drives_loading = False
+
+    def _draw_drives(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header(f"File Browser \u2014 {self.conn.xbox_ip}")
+
+        y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, "File Browser",
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
+        col = max(2, (w - 52) // 2)
+        if self.drives_loading:
+            spin = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+            ch = spin[int(time.time() * 10) % len(spin)]
+            self._addline(y, col, f" {ch} Loading drives...", curses.color_pair(C_CYAN))
+        elif not self.drives:
+            self._addline(y, col, "   No drives found.", curses.color_pair(C_YELLOW))
+        else:
+            if self.drives_cursor >= len(self.drives):
+                self.drives_cursor = 0
+            for i, drv in enumerate(self.drives):
+                if y >= h - 2:
+                    break
+                text = f"{drv}:\\"
+                if i == self.drives_cursor:
+                    self._addline(
+                        y, col, f" > {text}".ljust(50),
+                        curses.color_pair(C_SELECTED) | curses.A_BOLD, 50,
+                    )
+                else:
+                    self._addline(y, col, f"   {text}", curses.color_pair(C_CYAN))
+                y += 1
+
+        self._status(" \u2191\u2193 Navigate  Enter Open  Esc Back")
+        self.scr.refresh()
+
+    def _key_drives(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            self.mode = self.drives_return
+            self.cursor = 0
+        elif self.drives and not self.drives_loading:
+            n = len(self.drives)
+            if key in (curses.KEY_UP, ord("k")):
+                self.drives_cursor = (self.drives_cursor - 1) % n
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.drives_cursor = (self.drives_cursor + 1) % n
+            elif key in (curses.KEY_ENTER, 10, 13):
+                drv = self.drives[self.drives_cursor]
+                self._browse_path(f"{drv}:\\")
+        elif key in (ord("q"), ord("Q")):
+            return False
+        return True
+
+    # ── Browser Mode ────────────────────────────────────────────────────
+
+    def _browse_path(self, path):
+        self.browser_path = path
+        self.browser_entries = []
+        self.browser_cursor = 0
+        self.browser_scroll = 0
+        self.browser_loading = True
+        self.mode = self.BROWSER
+        threading.Thread(target=self._browser_thread, daemon=True).start()
+
+    def _browser_thread(self):
+        resp = xbdm_query(self.conn.xbox_ip, f'DIRLIST name="{self.browser_path}"')
+        self.browser_entries = parse_dirlist(resp)
+        self.browser_loading = False
+
+    def _draw_browser(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header(f"File Browser \u2014 {self.browser_path}")
+
+        y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, self.browser_path,
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
+        col = max(2, (w - 52) // 2)
+
+        # Build display list: parent entry + directory contents
+        display = []
+        display.append(("..", True, 0, True))  # parent nav
+        for e in self.browser_entries:
+            display.append((e["name"], e["is_dir"], e["size"], False))
+
+        nd = len(display)
+        if self.browser_cursor >= nd:
+            self.browser_cursor = max(0, nd - 1)
+
+        if self.browser_loading:
+            spin = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+            ch = spin[int(time.time() * 10) % len(spin)]
+            self._addline(y, col, f" {ch} Loading...", curses.color_pair(C_CYAN))
+        elif nd <= 1:
+            self._addline(y, col, "   Empty directory.", curses.color_pair(C_YELLOW))
+        else:
+            area_h = h - y - 1
+            # Adjust scroll to keep cursor visible
+            if self.browser_cursor < self.browser_scroll:
+                self.browser_scroll = self.browser_cursor
+            if self.browser_cursor >= self.browser_scroll + area_h:
+                self.browser_scroll = self.browser_cursor - area_h + 1
+
+            page = display[self.browser_scroll:self.browser_scroll + area_h]
+
+            for i, (name, is_dir, size, is_parent) in enumerate(page):
+                if y >= h - 1:
+                    break
+                didx = self.browser_scroll + i
+
+                if is_dir:
+                    icon = "\u2190" if is_parent else "\u25b6"
+                    size_str = "<DIR>"
+                else:
+                    icon = " "
+                    size_str = _fmt_size(size)
+
+                entry_text = f"{icon} {name:<33} {size_str:>10}"
+
+                if didx == self.browser_cursor:
+                    attr = curses.color_pair(C_SELECTED) | curses.A_BOLD
+                    self._addline(y, col, f" > {entry_text}".ljust(50), attr, 50)
+                else:
+                    if is_dir:
+                        color = C_CYAN
+                    elif name.lower().endswith(".xbe"):
+                        color = C_GREEN
+                    else:
+                        color = C_NORMAL
+                    self._addline(y, col, f"   {entry_text}", curses.color_pair(color))
+                y += 1
+
+        self._status(" \u2191\u2193 Navigate  Enter Open/Launch  Backspace Up  R Refresh  Esc Drives")
+        self.scr.refresh()
+
+    def _key_browser(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key == 27:
+            self.mode = self.DRIVES
+        elif key in (ord("q"), ord("Q")):
+            return False
+        elif self.browser_loading:
+            return True
+        else:
+            # Display list: ["..", *entries] — cursor 0 = parent
+            nd = 1 + len(self.browser_entries)
+            if key in (curses.KEY_UP, ord("k")):
+                self.browser_cursor = max(0, self.browser_cursor - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.browser_cursor = min(nd - 1, self.browser_cursor + 1)
+            elif key == curses.KEY_PPAGE:
+                area_h = self._size()[0] - 3
+                self.browser_cursor = max(0, self.browser_cursor - area_h)
+            elif key == curses.KEY_NPAGE:
+                area_h = self._size()[0] - 3
+                self.browser_cursor = min(nd - 1, self.browser_cursor + area_h)
+            elif key == curses.KEY_HOME:
+                self.browser_cursor = 0
+            elif key == curses.KEY_END:
+                self.browser_cursor = nd - 1
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if self.browser_cursor == 0:
+                    # ".." parent entry
+                    self._browser_go_up()
+                else:
+                    entry = self.browser_entries[self.browser_cursor - 1]
+                    if entry["is_dir"]:
+                        self._browse_path(self.browser_path + entry["name"] + "\\")
+                    elif entry["name"].lower().endswith(".xbe"):
+                        full_path = self.browser_path + entry["name"]
+                        self._begin_confirm(
+                            f'Launch {entry["name"]}?',
+                            lambda p=full_path: self._launch_xbe(p),
+                            self.BROWSER,
+                        )
+            elif key in (curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
+                self._browser_go_up()
+            elif key in (ord("r"), ord("R")):
+                self._browse_path(self.browser_path)
+        return True
+
+    def _browser_go_up(self):
+        """Navigate up one directory or back to drives."""
+        path = self.browser_path.rstrip("\\")
+        idx = path.rfind("\\")
+        if idx >= 0 and idx > 1:
+            self._browse_path(path[:idx + 1])
+        else:
+            self.mode = self.DRIVES
+
+    def _launch_xbe(self, full_path):
+        self.msg_queue.put(
+            LogLine(time.strftime("%H:%M:%S"), None,
+                    f'Launching {full_path}...',
+                    C_YELLOW, is_system=True)
+        )
+        ip = self.conn.xbox_ip
+        self.conn.disconnect()
+        xbdm_query(ip, f'MAGICBOOT title="{full_path}" debug')
+        self.mode = self.MONITOR
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────

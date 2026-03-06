@@ -18,6 +18,7 @@ Connects to XBDM (Xbox Debug Monitor) on port 731 and streams `OutputDebugString
 - **Config file** — remembers your default Xbox, recent consoles, log directory
 - **File logging** — toggle logging on/off, or enable by default in settings
 - **Screenshot capture** — dumps the Xbox framebuffer to PNG (pure stdlib, no PIL)
+- **File browser** — browse Xbox drives and directories, launch XBE files via MAGICBOOT
 - **Probe mode** — query XBDM version, debug name, running XBE, loaded modules
 - **Remote reboot** — reboot the Xbox directly from the monitor with confirmation
 - **Auto-reconnect** — reconnects automatically when the Xbox disconnects
@@ -58,6 +59,7 @@ That's it. No flags. The TUI handles everything.
 
 | Key | Action |
 |-----|--------|
+| `B` | Browse filesystem — list drives, navigate directories, launch XBEs |
 | `S` | Screenshot — capture framebuffer to PNG |
 | `F` | Filter — live search as you type |
 | `R` | Toggle raw mode (show unparsed XBDM output) |
@@ -72,6 +74,16 @@ That's it. No flags. The TUI handles everything.
 | `Home/End` | Jump to top/bottom |
 | `Esc` | Back to menu (connection stays alive) |
 | `Q` | Quit |
+
+### File Browser
+
+| Key | Action |
+|-----|--------|
+| `Up/Down` | Navigate entries |
+| `Enter` | Open directory or launch XBE (with confirmation) |
+| `Backspace` | Go up one directory |
+| `R` | Refresh current directory |
+| `Esc` | Back to drives / monitor |
 
 ### Filter Mode
 
@@ -119,9 +131,7 @@ xbMacson speaks the XBDM text protocol over TCP:
 4. Parses incoming `debugstr thread=NN cr|lf string=<message>` lines
 5. Displays parsed messages with timestamps, thread IDs, and color coding
 
-Screenshots use a separate one-shot connection: sends `SCREENSHOT`, reads the raw XRGB framebuffer, and encodes to PNG using `struct` + `zlib`.
-
-Reboot sends `REBOOT` on the live connection so the Xbox restarts without dropping the notification session.
+Screenshots, file browsing, reboot, and XBE launch all use separate one-shot connections so they don't interfere with the debug notification stream. The file browser sends `DRIVELIST` and `DIRLIST` to enumerate drives and directories, and `MAGICBOOT` to cold-boot into an XBE.
 
 ## Background
 
