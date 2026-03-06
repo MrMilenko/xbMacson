@@ -17,6 +17,7 @@ Connects to XBDM (Xbox Debug Monitor) on port 731 and streams `OutputDebugString
 - **Thread tracking** — shows which thread each message came from
 - **Config file** — remembers your default Xbox, recent consoles, log directory
 - **File logging** — toggle logging on/off during a session
+- **Screenshot capture** — dumps the Xbox framebuffer to PNG (pure stdlib, no PIL)
 - **Probe mode** — query XBDM version, debug name, running XBE, loaded modules
 - **Auto-reconnect** — reconnects automatically when the Xbox disconnects
 - **Zero dependencies** — pure Python stdlib (socket, curses, threading)
@@ -56,6 +57,7 @@ That's it. No flags. The TUI handles everything.
 
 | Key | Action |
 |-----|--------|
+| `S` | Screenshot — capture framebuffer to PNG |
 | `F` | Filter — live search as you type |
 | `R` | Toggle raw mode (show unparsed XBDM output) |
 | `L` | Toggle file logging |
@@ -86,6 +88,7 @@ Config is stored at `~/.xbmacson.json` and managed through the Settings menu. Yo
   "default_ip": "192.168.0.121",
   "auto_reconnect": true,
   "log_dir": "",
+  "screenshot_dir": "~/Desktop/xbox_screenshots",
   "last_connected": [
     ["192.168.0.121", "milenko"]
   ]
@@ -99,6 +102,7 @@ A sample config is included as `config.sample.json`.
 | `default_ip` | Xbox IP shown as first menu option for quick-connect |
 | `auto_reconnect` | Automatically reconnect on disconnect (default: true) |
 | `log_dir` | Directory for log files (default: current directory) |
+| `screenshot_dir` | Directory for screenshot PNGs (default: `~/Desktop/xbox_screenshots`) |
 | `last_connected` | Recent consoles — managed automatically |
 
 ## How It Works
@@ -110,6 +114,8 @@ xbMacson speaks the XBDM text protocol over TCP:
 3. Sends `NOTIFY debugstr` to subscribe to debug output
 4. Parses incoming `debugstr thread=NN cr|lf string=<message>` lines
 5. Displays parsed messages with timestamps, thread IDs, and color coding
+
+Screenshots use a separate one-shot connection: sends `SCREENSHOT`, reads the raw XRGB framebuffer, and encodes to PNG using `struct` + `zlib`.
 
 ## Background
 

@@ -10,6 +10,7 @@ Config stored at ~/.xbmacson.json
 
 import curses
 import socket
+import struct
 import sys
 import time
 import re
@@ -17,12 +18,14 @@ import os
 import json
 import threading
 import queue
+import zlib
 import concurrent.futures
 
 XBDM_PORT = 731
 RECV_BUFSIZE = 4096
 RECONNECT_DELAY = 3
 CONFIG_PATH = os.path.expanduser("~/.xbmacson.json")
+SCREENSHOT_DIR = os.path.expanduser("~/Desktop/xbox_screenshots")
 MAX_LOG_LINES = 10000
 
 DEBUGSTR_RE = re.compile(
@@ -51,6 +54,7 @@ def load_config():
         "default_ip": "",
         "auto_reconnect": True,
         "log_dir": "",
+        "screenshot_dir": SCREENSHOT_DIR,
         "last_connected": [],
     }
     try:
@@ -125,6 +129,98 @@ def check_xbdm_host(ip):
     except Exception:
         pass
     return None
+
+
+# ── PNG Writer ───────────────────────────────────────────────────────────
+
+def _write_png(path, width, height, pitch, framebuffer):
+    """Write XRGB framebuffer data as a PNG file (pure stdlib)."""
+    def _crc32(data):
+        return zlib.crc32(data) & 0xFFFFFFFF
+
+    def _chunk(tag, data):
+        chunk_data = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + chunk_data
+            + struct.pack(">I", _crc32(chunk_data))
+        )
+
+    raw = bytearray()
+    for row in range(height):
+        raw.append(0)  # filter: none
+        offset = row * pitch
+        for px in range(width):
+            o = offset + px * 4
+            raw.append(framebuffer[o + 2])  # R
+            raw.append(framebuffer[o + 1])  # G
+            raw.append(framebuffer[o])      # B
+
+    compressed = zlib.compress(bytes(raw), 9)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(_chunk(b"IHDR", ihdr))
+        f.write(_chunk(b"IDAT", compressed))
+        f.write(_chunk(b"IEND", b""))
+
+
+# ── XBDM Screenshot ─────────────────────────────────────────────────────
+
+def take_screenshot(ip, save_dir):
+    """Capture framebuffer via a one-shot XBDM connection. Returns path or error."""
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((ip, XBDM_PORT))
+        greeting = sock.recv(RECV_BUFSIZE).decode("utf-8", errors="replace").strip()
+        if not greeting.startswith("201"):
+            sock.close()
+            return f"Bad greeting: {greeting}"
+
+        sock.sendall(b"SCREENSHOT\r\n")
+
+        # Read header line: "203- binary response follows\r\n"
+        header = b""
+        while b"\r\n" not in header:
+            header += sock.recv(1)
+
+        # Read info line with dimensions
+        info = b""
+        while b"\r\n" not in info:
+            info += sock.recv(1)
+        info_str = info.decode("utf-8", errors="replace").strip()
+
+        vals = {}
+        for m in re.finditer(r"(\w+)=0x([0-9a-fA-F]+)", info_str):
+            vals[m.group(1)] = int(m.group(2), 16)
+
+        pitch = vals["pitch"]
+        width = vals["width"]
+        height = vals["height"]
+        fb_size = vals["framebuffersize"]
+
+        # Read raw framebuffer
+        data = b""
+        while len(data) < fb_size:
+            chunk = sock.recv(min(65536, fb_size - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+
+        if len(data) < fb_size:
+            return f"Incomplete: got {len(data)}/{fb_size} bytes"
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(save_dir, f"xbox_{ts}.png")
+        _write_png(path, width, height, pitch, data)
+        return path
+
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ── Data Types ───────────────────────────────────────────────────────────
@@ -338,6 +434,9 @@ class XbMacsonTUI:
 
         # Probe
         self.probe_lines = []
+
+        # Screenshot
+        self.screenshot_status = ""
 
         # Generic input
         self.input_buf = ""
@@ -743,6 +842,8 @@ class XbMacsonTUI:
             inds.append(f"LOG: {self.log_filename}")
         if not self.auto_scroll:
             inds.append("SCROLL LOCK")
+        if self.screenshot_status:
+            inds.append(self.screenshot_status)
 
         log_y = 1
         if inds:
@@ -793,7 +894,7 @@ class XbMacsonTUI:
         connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
         left = f" {connected_icon} {left.strip()}"
 
-        right = "F:Filter R:Raw L:Log P:Pause C:Clear I:Info D:Default Esc:Menu Q:Quit "
+        right = "S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info D:Default Esc:Menu Q:Quit "
         pad = w - len(left) - len(right)
         if pad < 1:
             bar = left[:w - 1]
@@ -815,6 +916,9 @@ class XbMacsonTUI:
             self.mode = self.MENU
             self.cursor = 0
 
+        elif key in (ord("s"), ord("S")):
+            self._take_screenshot()
+
         elif key in (ord("f"), ord("F")):
             self.input_buf = self.filter_str
             self.mode = self.FILTER_INPUT
@@ -831,6 +935,7 @@ class XbMacsonTUI:
             self.line_count = 0
             self.scroll_offset = 0
             self.auto_scroll = True
+            self.screenshot_status = ""
 
         elif key in (ord("l"), ord("L")):
             self._toggle_log()
@@ -892,6 +997,27 @@ class XbMacsonTUI:
             except OSError:
                 self.log_file = None
                 self.log_filename = ""
+
+    # ── Screenshot ───────────────────────────────────────────────────────
+
+    def _take_screenshot(self):
+        if not self.conn.xbox_ip:
+            return
+        self.screenshot_status = "Capturing..."
+        threading.Thread(target=self._screenshot_thread, daemon=True).start()
+
+    def _screenshot_thread(self):
+        save_dir = self.config.get("screenshot_dir", SCREENSHOT_DIR)
+        result = take_screenshot(self.conn.xbox_ip, save_dir)
+        if result.startswith("Error") or result.startswith("Incomplete"):
+            self.screenshot_status = f"Screenshot failed: {result}"
+        else:
+            fname = os.path.basename(result)
+            self.screenshot_status = f"Saved: {fname}"
+        threading.Timer(5.0, self._clear_screenshot_status).start()
+
+    def _clear_screenshot_status(self):
+        self.screenshot_status = ""
 
     # ── Filter Input (overlays monitor) ──────────────────────────────────
 
