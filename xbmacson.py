@@ -53,6 +53,7 @@ def load_config():
     defaults = {
         "default_ip": "",
         "auto_reconnect": True,
+        "default_logging": False,
         "log_dir": "",
         "screenshot_dir": SCREENSHOT_DIR,
         "last_connected": [],
@@ -112,7 +113,7 @@ def get_local_subnet():
 def check_xbdm_host(ip):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
+        s.settimeout(1.5)
         if s.connect_ex((ip, XBDM_PORT)) == 0:
             try:
                 greeting = s.recv(256).decode("utf-8", errors="replace").strip()
@@ -268,6 +269,14 @@ class XBDMConnection:
                 pass
             self.sock = None
 
+    def send_command(self, cmd):
+        """Send a command on the live connection."""
+        if self.sock and self.connected:
+            try:
+                self.sock.sendall(cmd.encode("utf-8") + b"\r\n")
+            except Exception:
+                pass
+
     def _emit(self, text, color=C_NORMAL, is_system=False, thread_id=None):
         self.msg_queue.put(
             LogLine(time.strftime("%H:%M:%S"), thread_id, text, color, is_system)
@@ -398,6 +407,7 @@ class XbMacsonTUI:
     FILTER_INPUT = "filter_input"
     SETTINGS = "settings"
     PROBE = "probe"
+    CONFIRM = "confirm"
 
     LOGO = [
         r"          _     __  __                             ",
@@ -437,6 +447,11 @@ class XbMacsonTUI:
 
         # Screenshot
         self.screenshot_status = ""
+
+        # Confirm dialog
+        self.confirm_msg = ""
+        self.confirm_cb = None
+        self.confirm_return = self.MONITOR
 
         # Generic input
         self.input_buf = ""
@@ -540,6 +555,8 @@ class XbMacsonTUI:
         self.mode = self.MONITOR
         self.conn.connect(ip)
         self._remember_ip(ip)
+        if self.config.get("default_logging", False) and not self.log_file:
+            self._toggle_log()
 
     # ── Main Loop ────────────────────────────────────────────────────────
 
@@ -552,6 +569,7 @@ class XbMacsonTUI:
             self.FILTER_INPUT: (self._draw_filter, self._key_filter),
             self.SETTINGS: (self._draw_settings, self._key_settings),
             self.PROBE: (self._draw_probe, self._key_probe),
+            self.CONFIRM: (self._draw_confirm, self._key_confirm),
         }
         while True:
             self._drain_queue()
@@ -569,6 +587,15 @@ class XbMacsonTUI:
 
     def _build_menu_opts(self):
         opts = []
+
+        # Resume active session
+        if self.conn.running or self.conn.connected:
+            name = self.conn.xbox_name or self.conn.xbox_ip
+            label = f"Resume session - {name}"
+            if self.line_count:
+                label += f" ({self.line_count} lines)"
+            opts.append(("resume", label))
+
         dip = self.config.get("default_ip", "")
         if dip:
             opts.append(("connect", f"Connect to {dip}"))
@@ -587,6 +614,8 @@ class XbMacsonTUI:
         opts.append(("scan", "Scan network for Xbox consoles"))
         opts.append(("enter", "Enter IP address"))
         opts.append(("settings", "Settings"))
+        if self.conn.running or self.conn.connected:
+            opts.append(("disconnect", "Disconnect"))
         opts.append(("quit", "Quit"))
         return opts
 
@@ -638,7 +667,9 @@ class XbMacsonTUI:
             self.cursor = (self.cursor + 1) % n
         elif key in (curses.KEY_ENTER, 10, 13):
             tag = self._menu_opts[self.cursor][0]
-            if tag == "connect":
+            if tag == "resume":
+                self.mode = self.MONITOR
+            elif tag == "connect":
                 self._start_monitor(self.config["default_ip"])
             elif tag.startswith("recent:"):
                 self._start_monitor(tag.split(":", 1)[1])
@@ -649,6 +680,8 @@ class XbMacsonTUI:
             elif tag == "settings":
                 self.mode = self.SETTINGS
                 self.cursor = 0
+            elif tag == "disconnect":
+                self.conn.disconnect()
             elif tag == "quit":
                 return False
         elif key in (ord("q"), ord("Q")):
@@ -672,12 +705,16 @@ class XbMacsonTUI:
         h, w = self._size()
         self._header("xbMacson")
 
-        y = h // 2 - 1
-        full = self.input_prompt + self.input_buf
-        col = max(0, (w - len(full) - 5) // 2)
+        y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+        y += 2
 
-        self._addline(y, col, self.input_prompt, curses.color_pair(C_CYAN))
-        ix = col + len(self.input_prompt)
+        col = max(2, (w - 52) // 2)
+        self._addline(y, col + 3, self.input_prompt, curses.color_pair(C_CYAN))
+        ix = col + 3 + len(self.input_prompt)
         field_w = min(30, w - ix - 2)
         self._addline(y, ix, self.input_buf.ljust(field_w), curses.color_pair(C_INPUT), field_w)
 
@@ -717,15 +754,19 @@ class XbMacsonTUI:
     def _begin_scan(self):
         self.scan_results = []
         self.scan_running = True
+        self.scan_error = ""
+        self.scan_subnet = ""
         self.scan_cursor = 0
         self.mode = self.SCAN
         threading.Thread(target=self._scan_thread, daemon=True).start()
 
     def _scan_thread(self):
-        _, subnet = get_local_subnet()
+        local_ip, subnet = get_local_subnet()
         if not subnet:
+            self.scan_error = "Could not determine local subnet"
             self.scan_running = False
             return
+        self.scan_subnet = f"{subnet}.x (from {local_ip})"
         with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
             futs = {
                 pool.submit(check_xbdm_host, f"{subnet}.{i}"): i
@@ -743,30 +784,50 @@ class XbMacsonTUI:
         self._header("Network Scan")
 
         y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, "Network Scanner",
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
+        col = max(2, (w - 52) // 2)
         if self.scan_running:
             spin = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
             ch = spin[int(time.time() * 10) % len(spin)]
+            subnet_info = f" ({self.scan_subnet})" if self.scan_subnet else ""
             self._addline(
-                y, 3, f"{ch} Scanning port {XBDM_PORT} on local subnet...",
+                y, col, f" {ch} Scanning port {XBDM_PORT}{subnet_info}...",
                 curses.color_pair(C_CYAN),
             )
             y += 1
             if self.scan_results:
                 self._addline(
-                    y, 3, f"Found {len(self.scan_results)} so far...",
+                    y, col, f"   Found {len(self.scan_results)} so far...",
                     curses.color_pair(C_GREEN),
                 )
                 y += 1
         else:
-            if self.scan_results:
+            if self.scan_error:
                 self._addline(
-                    y, 3,
-                    f"Found {len(self.scan_results)} Xbox console(s):",
+                    y, col, f"   {self.scan_error}",
+                    curses.color_pair(C_RED) | curses.A_BOLD,
+                )
+            elif self.scan_results:
+                self._addline(
+                    y, col,
+                    f"   Found {len(self.scan_results)} Xbox console(s):",
                     curses.color_pair(C_GREEN) | curses.A_BOLD,
                 )
             else:
                 self._addline(
-                    y, 3, "No Xbox consoles found.",
+                    y, col, "   No Xbox consoles found.",
                     curses.color_pair(C_YELLOW),
                 )
             y += 1
@@ -779,9 +840,9 @@ class XbMacsonTUI:
                 break
             text = f"{ip:<18} {name}"
             if i == self.scan_cursor:
-                self._addline(y, 3, f"> {text}".ljust(w - 5), curses.color_pair(C_SELECTED) | curses.A_BOLD, w - 5)
+                self._addline(y, col, f" > {text}".ljust(50), curses.color_pair(C_SELECTED) | curses.A_BOLD, 50)
             else:
-                self._addline(y, 3, f"  {text}", curses.color_pair(C_CYAN))
+                self._addline(y, col, f"   {text}", curses.color_pair(C_CYAN))
             y += 1
 
         status = " Scanning...  Esc Back" if self.scan_running else " \u2191\u2193 Select  Enter Connect  D Set Default  Esc Back"
@@ -894,7 +955,7 @@ class XbMacsonTUI:
         connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
         left = f" {connected_icon} {left.strip()}"
 
-        right = "S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info D:Default Esc:Menu Q:Quit "
+        right = "S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info X:Reboot D:Default Esc:Menu Q:Quit "
         pad = w - len(left) - len(right)
         if pad < 1:
             bar = left[:w - 1]
@@ -911,8 +972,7 @@ class XbMacsonTUI:
         if key in (ord("q"), ord("Q")):
             return False
 
-        if key == 27:  # Esc
-            self.conn.disconnect()
+        if key == 27:  # Esc - back to menu, connection stays alive
             self.mode = self.MENU
             self.cursor = 0
 
@@ -949,6 +1009,12 @@ class XbMacsonTUI:
             if self.conn.xbox_ip:
                 self.config["default_ip"] = self.conn.xbox_ip
                 save_config(self.config)
+
+        elif key in (ord("x"), ord("X")):
+            if self.conn.xbox_ip:
+                self._begin_confirm(
+                    "Reboot the Xbox?", self._do_reboot, self.MONITOR
+                )
 
         elif key == curses.KEY_UP:
             self.auto_scroll = False
@@ -994,6 +1060,13 @@ class XbMacsonTUI:
             path = os.path.join(log_dir, self.log_filename) if log_dir else self.log_filename
             try:
                 self.log_file = open(path, "a")
+                # Dump existing buffer so we capture what's already on screen
+                for ln in self.log_lines:
+                    pfx = f"[{ln.ts}]"
+                    if ln.thread_id:
+                        pfx += f" [T{ln.thread_id}]"
+                    self.log_file.write(f"{pfx} {ln.text}\n")
+                self.log_file.flush()
             except OSError:
                 self.log_file = None
                 self.log_filename = ""
@@ -1018,6 +1091,48 @@ class XbMacsonTUI:
 
     def _clear_screenshot_status(self):
         self.screenshot_status = ""
+
+    # ── Reboot ───────────────────────────────────────────────────────────
+
+    def _do_reboot(self):
+        if not self.conn.xbox_ip:
+            return
+        self.msg_queue.put(
+            LogLine(time.strftime("%H:%M:%S"), None,
+                    "Reboot command sent - Xbox restarting...",
+                    C_YELLOW, is_system=True)
+        )
+        self.conn.send_command("REBOOT")
+
+    # ── Confirm Dialog ───────────────────────────────────────────────────
+
+    def _begin_confirm(self, msg, callback, return_mode):
+        self.confirm_msg = msg
+        self.confirm_cb = callback
+        self.confirm_return = return_mode
+        self.mode = self.CONFIRM
+
+    def _draw_confirm(self):
+        self.scr.erase()
+        h, w = self._size()
+        self._header("Confirm")
+        y = h // 2 - 1
+        self._center(y, self.confirm_msg, curses.color_pair(C_YELLOW) | curses.A_BOLD)
+        self._center(y + 2, "Y = Yes     N / Esc = Cancel", curses.color_pair(C_DIM))
+        self._status(" Y: Confirm | N/Esc: Cancel")
+        self.scr.refresh()
+
+    def _key_confirm(self):
+        key = self.scr.getch()
+        if key == -1:
+            return True
+        if key in (ord("y"), ord("Y")):
+            if self.confirm_cb:
+                self.confirm_cb()
+            self.mode = self.confirm_return
+        elif key in (27, ord("n"), ord("N")):
+            self.mode = self.confirm_return
+        return True
 
     # ── Filter Input (overlays monitor) ──────────────────────────────────
 
@@ -1086,13 +1201,27 @@ class XbMacsonTUI:
         self._header(f"Xbox Info \u2014 {self.conn.xbox_ip}")
 
         y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, "System Info",
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
+        col = max(2, (w - 52) // 2)
         if not self.probe_lines:
-            self._addline(y, 3, "Probing...", curses.color_pair(C_DIM) | curses.A_DIM)
+            self._addline(y, col, "   Probing...", curses.color_pair(C_DIM) | curses.A_DIM)
         else:
             for line in self.probe_lines:
                 if y >= h - 2:
                     break
-                self._addline(y, 3, line, curses.color_pair(C_CYAN))
+                self._addline(y, col, f"   {line}", curses.color_pair(C_CYAN))
                 y += 1
 
         self._status(" Esc Back to monitor")
@@ -1115,30 +1244,46 @@ class XbMacsonTUI:
         h, w = self._size()
         self._header("Settings")
 
+        y = 2
+        for line in self.LOGO:
+            if y < h - 2:
+                self._center(y, line, curses.color_pair(C_GREEN) | curses.A_BOLD)
+            y += 1
+
+        y += 1
+        if y < h - 2:
+            self._center(
+                y, "Settings Menu",
+                curses.color_pair(C_DIM) | curses.A_DIM,
+            )
+        y += 2
+
         dip = self.config.get("default_ip", "") or "(not set)"
         ldir = self.config.get("log_dir", "") or "(current directory)"
         ar = "Yes" if self.config.get("auto_reconnect", True) else "No"
+        dl = "Yes" if self.config.get("default_logging", False) else "No"
 
         items = [
-            (f"Default Xbox IP:   {dip}",),
-            (f"Log Directory:     {ldir}",),
-            (f"Auto-Reconnect:    {ar}",),
-            ("Clear Recent Consoles",),
-            ("Back",),
+            f"Default Xbox IP:    {dip}",
+            f"Log Directory:      {ldir}",
+            f"Auto-Reconnect:     {ar}",
+            f"Default Logging:    {dl}",
+            "Clear Recent Consoles",
+            "Back",
         ]
 
         if self.cursor >= len(items):
             self.cursor = 0
 
-        y = 3
-        for i, (text,) in enumerate(items):
+        col = max(2, (w - 52) // 2)
+        for i, text in enumerate(items):
             if y >= h - 2:
                 break
             if i == self.cursor:
-                self._addline(y, 3, f"> {text}".ljust(w - 5), curses.color_pair(C_SELECTED) | curses.A_BOLD, w - 5)
+                self._addline(y, col, f" > {text}".ljust(50), curses.color_pair(C_SELECTED) | curses.A_BOLD, 50)
             else:
-                self._addline(y, 3, f"  {text}", curses.color_pair(C_CYAN))
-            y += 2
+                self._addline(y, col, f"   {text}", curses.color_pair(C_CYAN))
+            y += 1
 
         self._status(" \u2191\u2193 Navigate  Enter Edit/Toggle  Esc Back")
         self.scr.refresh()
@@ -1151,9 +1296,9 @@ class XbMacsonTUI:
             self.mode = self.MENU
             self.cursor = 0
         elif key in (curses.KEY_UP, ord("k")):
-            self.cursor = (self.cursor - 1) % 5
+            self.cursor = (self.cursor - 1) % 6
         elif key in (curses.KEY_DOWN, ord("j")):
-            self.cursor = (self.cursor + 1) % 5
+            self.cursor = (self.cursor + 1) % 6
         elif key in (curses.KEY_ENTER, 10, 13):
             if self.cursor == 0:  # default IP
                 self.input_buf = self.config.get("default_ip", "")
@@ -1172,10 +1317,13 @@ class XbMacsonTUI:
             elif self.cursor == 2:  # auto-reconnect toggle
                 self.config["auto_reconnect"] = not self.config.get("auto_reconnect", True)
                 save_config(self.config)
-            elif self.cursor == 3:  # clear recent
+            elif self.cursor == 3:  # default logging toggle
+                self.config["default_logging"] = not self.config.get("default_logging", False)
+                save_config(self.config)
+            elif self.cursor == 4:  # clear recent
                 self.config["last_connected"] = []
                 save_config(self.config)
-            elif self.cursor == 4:  # back
+            elif self.cursor == 5:  # back
                 self.mode = self.MENU
                 self.cursor = 0
         return True
