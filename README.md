@@ -16,9 +16,10 @@ Connects to XBDM (Xbox Debug Monitor) on port 731 and streams `OutputDebugString
 - **Color-coded output** — errors (red), warnings (yellow), init messages (green), tags (cyan)
 - **Thread tracking** — shows which thread each message came from
 - **Config file** — remembers your default Xbox, recent consoles, log directory
-- **File logging** — toggle logging on/off during a session
+- **File logging** — toggle logging on/off, or enable by default in settings
 - **Screenshot capture** — dumps the Xbox framebuffer to PNG (pure stdlib, no PIL)
 - **Probe mode** — query XBDM version, debug name, running XBE, loaded modules
+- **Remote reboot** — reboot the Xbox directly from the monitor with confirmation
 - **Auto-reconnect** — reconnects automatically when the Xbox disconnects
 - **Zero dependencies** — pure Python stdlib (socket, curses, threading)
 
@@ -64,11 +65,12 @@ That's it. No flags. The TUI handles everything.
 | `P` | Pause/resume output |
 | `C` | Clear screen |
 | `I` | Probe Xbox info (version, modules, running XBE) |
+| `X` | Reboot Xbox (with confirmation) |
 | `D` | Set current Xbox as default |
 | `Up/Down` | Scroll through history |
 | `PgUp/PgDn` | Scroll by page |
 | `Home/End` | Jump to top/bottom |
-| `Esc` | Back to menu |
+| `Esc` | Back to menu (connection stays alive) |
 | `Q` | Quit |
 
 ### Filter Mode
@@ -87,6 +89,7 @@ Config is stored at `~/.xbmacson.json` and managed through the Settings menu. Yo
 {
   "default_ip": "192.168.0.121",
   "auto_reconnect": true,
+  "default_logging": false,
   "log_dir": "",
   "screenshot_dir": "~/Desktop/xbox_screenshots",
   "last_connected": [
@@ -101,6 +104,7 @@ A sample config is included as `config.sample.json`.
 |---------|-------------|
 | `default_ip` | Xbox IP shown as first menu option for quick-connect |
 | `auto_reconnect` | Automatically reconnect on disconnect (default: true) |
+| `default_logging` | Start logging automatically on connect (default: false) |
 | `log_dir` | Directory for log files (default: current directory) |
 | `screenshot_dir` | Directory for screenshot PNGs (default: `~/Desktop/xbox_screenshots`) |
 | `last_connected` | Recent consoles — managed automatically |
@@ -117,6 +121,8 @@ xbMacson speaks the XBDM text protocol over TCP:
 
 Screenshots use a separate one-shot connection: sends `SCREENSHOT`, reads the raw XRGB framebuffer, and encodes to PNG using `struct` + `zlib`.
 
+Reboot sends `REBOOT` on the live connection so the Xbox restarts without dropping the notification session.
+
 ## Background
 
 [xbWatson](https://xboxdevwiki.net/XBDM) was the original Xbox Debug Monitor client, but it only runs on Windows (and really only on XP-era machines with the XDK installed). xbMacson provides the same core functionality — streaming debug output — on any platform, with a modern terminal UI.
@@ -126,3 +132,7 @@ Named as a nod to the original, with a Mac twist because Milenko is a bougie bit
 ## License
 
 MIT
+
+---
+
+README written with help from [Claude](https://claude.ai).
