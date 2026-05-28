@@ -4,7 +4,7 @@ xbMacson - Cross-platform Xbox Debug Monitor (TUI)
 Connects to XBDM (Xbox Debug Monitor) on port 731
 and streams debug output from OutputDebugString/DbgPrint.
 
-No flags needed — everything is interactive.
+No flags needed: everything is interactive.
 Config stored at ~/.xbmacson.json
 """
 
@@ -23,14 +23,101 @@ import concurrent.futures
 
 XBDM_PORT = 731
 RECV_BUFSIZE = 4096
-RECONNECT_DELAY = 3
+RECONNECT_INTERVAL = 0.4
+RECONNECT_TIMEOUT = 60   # give up reconnecting after this many seconds
+NOTIFY_RECV_TIMEOUT = 30 # treat this much silence on the notify channel as a dead link
+ACCEPT_TIMEOUT = 30      # re-register if Xbox does not dial us back within this
 CONFIG_PATH = os.path.expanduser("~/.xbmacson.json")
 SCREENSHOT_DIR = os.path.expanduser("~/Desktop/xbox_screenshots")
 MAX_LOG_LINES = 10000
 
 DEBUGSTR_RE = re.compile(
-    r'^debugstr\s+thread=(\d+)\s+(cr|lf)\s+string=(.*)', re.DOTALL
+    r'^debugstr\s+(?:stop\s+)?thread=(\d+)\s+(?:(cr|lf|crlf)\s+)?string=(.*)',
+    re.DOTALL,
 )
+
+# ── XBDM Notification Patterns ─────────────────────────────────────────
+# Exact wire formats taken from FGetNotifySz() in the XBDM kernel source
+# (private/ntos/dm/xbdm/dmnotify.c).
+
+BREAK_RE = re.compile(
+    r'^break\s+addr=0x([0-9a-fA-F]+)\s+thread=(\d+)'
+)
+SINGLESTEP_RE = re.compile(
+    r'^singlestep\s+addr=0x([0-9a-fA-F]+)\s+thread=(\d+)'
+)
+# "data [read|write|execute]=0x%08x addr=0x%08x thread=%lu"
+DATABREAK_RE = re.compile(
+    r'^data\s+(read|write|execute)=0x([0-9a-fA-F]+)'
+    r'\s+addr=0x([0-9a-fA-F]+)\s+thread=(\d+)'
+)
+# "assert [stop] thread=%d string=..."
+ASSERT_RE = re.compile(
+    r'^assert\s+(?:stop\s+)?thread=(\d+)(?:\s+string=(.*))?', re.DOTALL
+)
+# "exception code=0x%08x thread=%d address=0x%08x [read|write]=0x%08x [first] [noncont]"
+EXCEPTION_RE = re.compile(
+    r'^exception\s+code=0x([0-9a-fA-F]+)\s+thread=(\d+)'
+    r'\s+address=0x([0-9a-fA-F]+)'
+    r'(?:\s+(read|write)=0x([0-9a-fA-F]+))?'
+    r'(?:\s+(first))?(?:\s+(noncont))?'
+)
+EXEC_RE = re.compile(
+    r'^execution\s+(\S+)'
+)
+# "modload name="..." base=0x%08x size=0x%08x check=0x%08x timestamp=0x%08x [tls] [xbe]"
+MODLOAD_RE = re.compile(
+    r'^modload\s+name="([^"]+)"'
+    r'(?:\s+base=0x([0-9a-fA-F]+))?'
+    r'(?:\s+size=0x([0-9a-fA-F]+))?'
+    r'(?:\s+check=0x([0-9a-fA-F]+))?'
+    r'(?:\s+timestamp=0x([0-9a-fA-F]+))?'
+)
+# "sectload name="..." base=0x%08x size=0x%08x index=%d flags=%d"
+SECTLOAD_RE = re.compile(
+    r'^sect(load|unload)\s+name="([^"]+)"'
+    r'(?:\s+base=0x([0-9a-fA-F]+))?'
+    r'(?:\s+size=0x([0-9a-fA-F]+))?'
+)
+MODUNLOAD_RE = re.compile(
+    r'^modunload\s+name="([^"]+)"'
+)
+CREATE_THREAD_RE = re.compile(
+    r'^create\s+thread=(\d+)(?:\s+start=0x([0-9a-fA-F]+))?'
+)
+DESTROY_THREAD_RE = re.compile(
+    r'^(?:destroy|terminate)\s+thread=(\d+)'
+)
+# "rip [stop] thread=%lu [string=...]"
+RIP_RE = re.compile(
+    r'^rip\s+(?:stop\s+)?thread=(\d+)(?:\s+string=(.*))?', re.DOTALL
+)
+STACKTRACE_RE = re.compile(
+    r'^stacktrace\s+thread=(\d+)'
+)
+
+# Well-known exception codes (Win32/Xbox)
+EXCEPTION_NAMES = {
+    0x80000003: "Breakpoint",
+    0x80000004: "Single Step",
+    0xC0000005: "Access Violation",
+    0xC0000006: "In Page Error",
+    0xC000001D: "Illegal Instruction",
+    0xC0000025: "Non-continuable Exception",
+    0xC00000FD: "Stack Overflow",
+    0xC0000094: "Integer Divide by Zero",
+    0xC0000095: "Integer Overflow",
+    0xC000008C: "Array Bounds Exceeded",
+    0xC0000096: "Privileged Instruction",
+    0xC000013A: "Control-C",
+    0xC0000194: "Possible Deadlock",
+}
+
+
+def _exc_name(code):
+    """Return human-readable exception name or hex code."""
+    return EXCEPTION_NAMES.get(code, f"0x{code:08X}")
+
 
 # Color pair IDs
 C_NORMAL = 0
@@ -45,6 +132,11 @@ C_STATUS = 8
 C_HEADER = 9
 C_INPUT = 10
 C_SELECTED = 11
+C_BLUE = 14
+
+# Thread color pairs: 20-27
+THREAD_COLORS_BASE = 20
+NUM_THREAD_COLORS = 7
 
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -81,18 +173,30 @@ def save_config(cfg):
 def parse_debug_line(line):
     m = DEBUGSTR_RE.match(line)
     if m:
-        return (m.group(1), m.group(3))
+        # cr/lf group is None when the field is absent: treat as "lf"
+        return (m.group(1), m.group(2) or "lf", m.group(3))
     return None
 
 
 def classify_line(text):
     lower = text.lower()
-    if any(w in lower for w in ["error", "fail", "assert", "crash"]):
+    if any(w in lower for w in [
+        "error", "fail", "assert", "crash", "fatal", "exception",
+        "abort", "panic", "corrupt", "violation", "denied",
+    ]):
         return C_RED
-    if any(w in lower for w in ["warn", "invalid", "not found"]):
+    if any(w in lower for w in [
+        "warn", "invalid", "not found", "deprecated", "timeout",
+        "retry", "slow", "missing", "skip", "fallback",
+    ]):
         return C_YELLOW
-    if any(w in lower for w in ["init", "start", "loaded", "success", "connected"]):
+    if any(w in lower for w in [
+        "init", "start", "loaded", "success", "connected", "ready",
+        "complete", "done", "ok", "mounted", "registered",
+    ]):
         return C_GREEN
+    if any(w in lower for w in ["debug", "trace", "verbose"]):
+        return C_BLUE
     if text.startswith("[") and "]" in text:
         return C_CYAN
     return C_NORMAL
@@ -353,6 +457,12 @@ class XBDMConnection:
         self.xbox_name = ""
         self.xbox_ip = ""
         self.dm_version = ""
+        self.listen_sock = None  # bound on _run start; xbox dials us here
+        self.notify_port = 0     # the port the xbox knows to call back on
+        self._thread_bufs = {}  # per-thread cr/lf line assembly
+        # Set when XBDM halts the box; TUI watches it for the Continue/Reboot prompt.
+        self.stopped_thread = None
+        self.stopped_reason = ""
 
     def connect(self, ip):
         self.xbox_ip = ip
@@ -360,25 +470,88 @@ class XBDMConnection:
         self.connected = False
         self.xbox_name = ""
         self.dm_version = ""
+        self._thread_bufs = {}
+        self.stopped_thread = None
+        self.stopped_reason = ""
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def disconnect(self):
         self.running = False
         self.connected = False
-        if self.sock:
+        self.stopped_thread = None
+        # Remove our persistent notifyat entry so the Xbox stops dialing
+        # this port forever, then drop the debug session.
+        if self.xbox_ip and self.notify_port:
             try:
-                self.sock.close()
+                xbdm_query(self.xbox_ip, f"notifyat port={self.notify_port} drop")
             except Exception:
                 pass
-            self.sock = None
-
-    def send_command(self, cmd):
-        """Send a command on the live connection."""
-        if self.sock and self.connected:
+        if self.xbox_ip:
             try:
-                self.sock.sendall(cmd.encode("utf-8") + b"\r\n")
+                xbdm_query(self.xbox_ip, "DEBUGGER disconnect")
             except Exception:
+                pass
+        for attr in ("sock", "listen_sock"):
+            s = getattr(self, attr)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.notify_port = 0
+
+    def continue_execution(self):
+        """Resume after a stop: send CONTINUE + GO on a one-shot connection,
+        matching xbWatson's DmContinueThread() + DmGo() sequence."""
+        tid = self.stopped_thread
+        if tid is None:
+            return
+        self.stopped_thread = None
+        self.stopped_reason = ""
+        try:
+            xbdm_query(self.xbox_ip, f"CONTINUE thread={tid}")
+            xbdm_query(self.xbox_ip, "GO")
+            self._emit("Execution resumed.", C_GREEN, is_system=True)
+        except Exception as e:
+            self._emit(f"Failed to resume: {e}", C_RED, is_system=True)
+
+    def force_go(self):
+        """Hardwired GO: send CONTINUE (if we have a thread) + GO
+        regardless of local state, in case the Xbox is stuck waiting."""
+        tid = self.stopped_thread
+        self.stopped_thread = None
+        self.stopped_reason = ""
+        try:
+            if tid:
+                xbdm_query(self.xbox_ip, f"CONTINUE thread={tid}")
+            xbdm_query(self.xbox_ip, "GO")
+            self._emit("GO sent.", C_GREEN, is_system=True)
+        except Exception as e:
+            self._emit(f"GO failed: {e}", C_RED, is_system=True)
+
+    @staticmethod
+    def _enable_keepalive(sock):
+        # A rebooting Xbox usually drops the link without a clean close, so
+        # turn on TCP keepalive and tune it to notice a dead peer in ~10s
+        # rather than the OS default. Options vary by platform; set what exists.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            return
+        idle, intvl, cnt = 4, 2, 3
+        for opt, val in (("TCP_KEEPIDLE", idle), ("TCP_KEEPALIVE", idle),
+                         ("TCP_KEEPINTVL", intvl), ("TCP_KEEPCNT", cnt)):
+            if hasattr(socket, opt):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+                except OSError:
+                    pass
+        if hasattr(sock, "ioctl") and hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, intvl * 1000))
+            except OSError:
                 pass
 
     def _emit(self, text, color=C_NORMAL, is_system=False, thread_id=None):
@@ -386,102 +559,369 @@ class XBDMConnection:
             LogLine(time.strftime("%H:%M:%S"), thread_id, text, color, is_system)
         )
 
-    def _run(self):
-        while self.running:
-            try:
+    def _handle_stop(self, tid, reason):
+        # XBDM has halted the box. Record state so the TUI status bar
+        # (and, later, a toast) can prompt for Continue / Go / Reboot.
+        self.stopped_thread = tid
+        self.stopped_reason = reason
+        self._emit(
+            f"STOPPED: {reason} (thread {tid})",
+            C_RED, is_system=True, thread_id=tid,
+        )
+
+    # ── Notification dispatcher ─────────────────────────────────────────
+
+    def _dispatch_notification(self, line):
+        """Route an incoming XBDM notification line to the right handler.
+        Wire formats match FGetNotifySz() in private/ntos/dm/xbdm/dmnotify.c."""
+
+        # Keepalive
+        if line == "null":
+            return
+
+        # XBDM adds a "stop" token after the keyword when the box has halted
+        # ("break stop addr=..."). Per-type regexes handle it for debugstr/
+        # assert/rip; we check it here for break/exception.
+        has_stop = False
+        # Check for stop right after the first keyword
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[1] == "stop":
+            has_stop = True
+
+        # 1. Debug strings: with proper cr/lf/crlf line assembly
+        parsed = parse_debug_line(line)
+        if parsed:
+            tid, term, msg = parsed
+            if term == "cr":
+                self._thread_bufs.setdefault(tid, "")
+                self._thread_bufs[tid] += msg
+            else:
+                # lf or crlf: flush assembled line
+                full = self._thread_bufs.pop(tid, "") + msg
+                if full.strip():
+                    self._emit(full, classify_line(full), thread_id=tid)
+            return
+
+        # 2. Assert: "assert [stop] thread=%d string=..."
+        m = ASSERT_RE.match(line)
+        if m:
+            tid = m.group(1)
+            msg = m.group(2) or ""
+            self._emit(
+                f"Xbox Assertion Failed - thread {tid} [{self.xbox_name}]",
+                C_RED, is_system=True, thread_id=tid,
+            )
+            if msg.strip():
+                self._emit(msg.strip(), C_RED, is_system=True, thread_id=tid)
+            if has_stop:
+                self._handle_stop(tid, "Assertion Failed")
+            return
+
+        # 3. Exception: "exception code=0x%08x thread=%d address=0x%08x
+        #                  [read|write]=0x%08x [first] [noncont]"
+        m = EXCEPTION_RE.match(line)
+        if m:
+            code = int(m.group(1), 16)
+            tid = m.group(2)
+            addr = m.group(3)
+            rw_type = m.group(4)    # "read" or "write" or None
+            rw_addr = m.group(5)    # address or None
+            first = m.group(6)      # "first" or None
+            noncont = m.group(7)    # "noncont" or None
+            name = _exc_name(code)
+            chance = "first" if first else "second"
+            if code == 0xC0000005 and rw_type and rw_addr:
+                if rw_type == "write":
+                    self._emit(
+                        f"The instruction at address 0x{addr.upper()} referenced "
+                        f"memory at address 0x{rw_addr.upper()}.  "
+                        f"The memory could not be written.",
+                        C_RED, is_system=True, thread_id=tid,
+                    )
+                else:
+                    self._emit(
+                        f"The instruction at address 0x{addr.upper()} referenced "
+                        f"memory at address 0x{rw_addr.upper()}.  "
+                        f"The memory could not be read.",
+                        C_RED, is_system=True, thread_id=tid,
+                    )
+            elif code == 0x80000003:
                 self._emit(
-                    f"Connecting to {self.xbox_ip}:{XBDM_PORT}...",
-                    C_CYAN, is_system=True,
+                    f"A breakpoint exception (0x{addr.upper()}) has been reached "
+                    f"in the application at location 0x{addr.upper()}.",
+                    C_RED, is_system=True, thread_id=tid,
                 )
-
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(10)
-                self.sock.connect((self.xbox_ip, XBDM_PORT))
-
-                greeting = self.sock.recv(RECV_BUFSIZE).decode(
-                    "utf-8", errors="replace"
-                ).strip()
-
-                if not greeting.startswith("201"):
-                    self._emit(f"Bad greeting: {greeting}", C_RED, is_system=True)
-                    self.running = False
-                    return
-
-                # Get debug name
-                try:
-                    self.sock.sendall(b"DBGNAME\r\n")
-                    resp = self.sock.recv(RECV_BUFSIZE).decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    if resp.startswith("200"):
-                        self.xbox_name = resp.replace("200- ", "")
-                except Exception:
-                    pass
-
-                # Get DM version
-                try:
-                    self.sock.sendall(b"DMVERSION\r\n")
-                    resp = self.sock.recv(RECV_BUFSIZE).decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    if resp.startswith("200"):
-                        self.dm_version = resp.replace("200- ", "")
-                except Exception:
-                    pass
-
-                # Subscribe to debug strings
-                self.sock.sendall(b"NOTIFY debugstr\r\n")
-                self.sock.recv(RECV_BUFSIZE)  # consume response
-
-                self.connected = True
-                name_part = f" ({self.xbox_name})" if self.xbox_name else ""
+            else:
                 self._emit(
-                    f"Connected to {self.xbox_ip}{name_part}",
+                    f"An exception ({name}) occurred in the application "
+                    f"at location 0x{addr.upper()} ({chance} chance).",
+                    C_RED, is_system=True, thread_id=tid,
+                )
+            if noncont:
+                self._emit(
+                    "Exception is non-continuable.",
+                    C_RED, is_system=True, thread_id=tid,
+                )
+            if has_stop and not first:
+                # xbWatson only handles second-chance exceptions
+                self._handle_stop(tid, f"Exception ({name})")
+            return
+
+        # 4. Breakpoint: "break addr=0x%08x thread=%d"
+        m = BREAK_RE.match(line)
+        if m:
+            addr, tid = m.group(1), m.group(2)
+            self._emit(
+                f"Break: 0x{addr.upper()} thread={tid}",
+                C_RED, is_system=True, thread_id=tid,
+            )
+            if has_stop:
+                self._handle_stop(tid, "Breakpoint")
+            return
+
+        # 5. Single step: xbWatson never shows these; drop the noise.
+        if SINGLESTEP_RE.match(line):
+            return
+
+        # 6. Data breakpoint: "data [read|write|execute]=0x%08x addr=0x%08x thread=%lu"
+        m = DATABREAK_RE.match(line)
+        if m:
+            access = m.group(1)
+            data_addr = m.group(2)
+            addr = m.group(3)
+            tid = m.group(4)
+            self._emit(
+                f"Databreak: {access}=0x{data_addr.upper()} "
+                f"addr=0x{addr.upper()} thread={tid}",
+                C_RED, is_system=True, thread_id=tid,
+            )
+            if has_stop:
+                self._handle_stop(tid, "Data Breakpoint")
+            return
+
+        # 7. Execution state: "execution [stopped|started|rebooting|pending]"
+        m = EXEC_RE.match(line)
+        if m:
+            state = m.group(1).lower()
+            msgs = {
+                "rebooting": "xbMacson: Xbox is restarting.",
+                "pending": "Execution pending.",
+                "started": "Execution started.",
+                "stopped": "Execution stopped.",
+            }
+            self._emit(
+                msgs.get(state, f"Execution: {state}"),
+                C_YELLOW, is_system=True,
+            )
+            return
+
+        # 8. RIP: "rip [stop] thread=%lu [string=...]"
+        m = RIP_RE.match(line)
+        if m:
+            tid = m.group(1)
+            msg = m.group(2) or ""
+            self._emit(
+                f"A RIP error has occurred on the Xbox (thread {tid}).",
+                C_RED, is_system=True, thread_id=tid,
+            )
+            if msg.strip():
+                self._emit(
+                    f"The error description was: {msg.strip()}",
+                    C_RED, is_system=True, thread_id=tid,
+                )
+            if has_stop:
+                self._handle_stop(tid, "RIP Error")
+            return
+
+        # 9. Stack trace request: xbWatson never shows these.
+        if STACKTRACE_RE.match(line):
+            return
+
+        # 10. Module load: "modload name="..." base=0x... size=0x... [xbe]"
+        m = MODLOAD_RE.match(line)
+        if m:
+            name = m.group(1)
+            base = m.group(2) or "?"
+            size = m.group(3) or "?"
+            xbe = " [XBE]" if "xbe" in line else ""
+            self._emit(
+                f"Loaded: {name} base=0x{base.upper()} "
+                f"size=0x{size.upper()}{xbe}",
+                C_GREEN, is_system=True,
+            )
+            return
+
+        # 11. Section load/unload: "sect[load|unload] name="..." base=0x... size=0x..."
+        m = SECTLOAD_RE.match(line)
+        if m:
+            action = m.group(1)  # "load" or "unload"
+            name = m.group(2)
+            base = m.group(3) or "?"
+            size = m.group(4) or "?"
+            if action == "load":
+                self._emit(
+                    f"Section loaded: {name} base=0x{base.upper()} "
+                    f"size=0x{size.upper()}",
                     C_GREEN, is_system=True,
                 )
+            else:
+                self._emit(
+                    f"Section unloaded: {name}",
+                    C_YELLOW, is_system=True,
+                )
+            return
 
-                self.sock.settimeout(None)
+        # 12. Module unload
+        m = MODUNLOAD_RE.match(line)
+        if m:
+            self._emit(f"Unloaded: {m.group(1)}", C_YELLOW, is_system=True)
+            return
 
-                buffer = ""
+        # 13/14. Thread create and destroy: xbWatson never shows these and
+        # they bury the real debug output. Consume and drop them.
+        if CREATE_THREAD_RE.match(line) or DESTROY_THREAD_RE.match(line):
+            return
+
+        # Fallback: show unrecognised lines as-is
+        self._emit(line, classify_line(line), is_system=True)
+
+    def _run(self):
+        first_connect = True
+        shown_error = False
+        deadline = None     # armed after a failure; cleared on progress
+        registered = False  # have we sent NOTIFYAT this cycle?
+
+        # Bind the listen socket once for the whole session. XBDM dials this
+        # port for every notification session, including the ones that follow
+        # a reset, because the Xbox persists our registration to its .ini.
+        try:
+            self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listen_sock.bind(("0.0.0.0", 0))
+            self.listen_sock.listen(2)
+            self.notify_port = self.listen_sock.getsockname()[1]
+        except OSError as e:
+            self._emit(f"Could not bind a local port: {e}", C_RED, is_system=True)
+            return
+
+        while self.running:
+            # Register (or re-register) with XBDM. DBGNAME/DMVERSION are
+            # only for the connect banner; DEBUGGER connect enables debug
+            # events; NOTIFYAT tells XBDM to dial us back at our port.
+            if not registered:
+                try:
+                    if first_connect:
+                        self._emit(
+                            f"Connecting to {self.xbox_ip}:{XBDM_PORT} ...",
+                            C_CYAN, is_system=True,
+                        )
+                        try:
+                            resp = xbdm_query(self.xbox_ip, "DBGNAME")
+                            if resp.startswith("200"):
+                                self.xbox_name = resp.replace("200- ", "").strip()
+                        except Exception:
+                            pass
+                        try:
+                            resp = xbdm_query(self.xbox_ip, "DMVERSION")
+                            if resp.startswith("200"):
+                                self.dm_version = resp.replace("200- ", "").strip()
+                        except Exception:
+                            pass
+                    try:
+                        xbdm_query(self.xbox_ip, "DEBUGGER connect")
+                    except Exception:
+                        pass
+                    xbdm_query(self.xbox_ip, f"notifyat port={self.notify_port}")
+                    registered = True
+                    deadline = None
+                except (socket.timeout, ConnectionRefusedError,
+                        ConnectionResetError, OSError):
+                    if self.running and not shown_error:
+                        self._emit("Waiting for Xbox...", C_YELLOW, is_system=True)
+                        shown_error = True
+                    if not self.running:
+                        break
+                    if deadline is None:
+                        deadline = time.monotonic() + RECONNECT_TIMEOUT
+                    if time.monotonic() > deadline:
+                        self._emit(
+                            f"Could not reach Xbox within {int(RECONNECT_TIMEOUT)}s; giving up.",
+                            C_RED, is_system=True,
+                        )
+                        self.running = False
+                        break
+                    time.sleep(RECONNECT_INTERVAL)
+                    continue
+
+            # Wait for XBDM to dial us back. If accept times out, the Xbox
+            # may have dropped our registration after a failed call, so
+            # re-register on the next iteration.
+            self.listen_sock.settimeout(ACCEPT_TIMEOUT)
+            try:
+                self.sock, _ = self.listen_sock.accept()
+            except socket.timeout:
+                # Xbox did not dial back in time. Could be a transient drop,
+                # or a firewall blocking incoming connections. Arm the same
+                # 60s deadline as a registration failure before giving up.
+                if self.running and not shown_error:
+                    self._emit("Waiting for Xbox...", C_YELLOW, is_system=True)
+                    shown_error = True
+                if deadline is None:
+                    deadline = time.monotonic() + RECONNECT_TIMEOUT
+                if time.monotonic() > deadline:
+                    self._emit(
+                        f"Xbox did not dial back within {int(RECONNECT_TIMEOUT)}s; giving up.",
+                        C_RED, is_system=True,
+                    )
+                    self.running = False
+                    break
+                registered = False
+                continue
+            except OSError as e:
+                if self.running and not shown_error:
+                    self._emit(f"Accept failed: {e}", C_RED, is_system=True)
+                    shown_error = True
+                registered = False
+                time.sleep(RECONNECT_INTERVAL)
+                continue
+
+            self._enable_keepalive(self.sock)
+            self.sock.settimeout(NOTIFY_RECV_TIMEOUT)
+            self.connected = True
+            deadline = None
+            self._thread_bufs = {}
+            self.stopped_thread = None
+
+            if first_connect:
+                name_part = f" ({self.xbox_name})" if self.xbox_name else ""
+                self._emit(
+                    f"Connected to {self.xbox_ip}{name_part}.",
+                    C_GREEN, is_system=True,
+                )
+                first_connect = False
+            shown_error = False
+
+            buffer = ""
+            try:
                 while self.running:
                     data = self.sock.recv(RECV_BUFSIZE)
                     if not data:
-                        self._emit(
-                            "Connection closed by Xbox", C_RED, is_system=True
-                        )
-                        break
-
+                        break  # session ended; XBDM will dial back when it can
                     buffer += data.decode("utf-8", errors="replace")
-
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         line = line.rstrip("\r")
                         if not line:
                             continue
-
-                        parsed = parse_debug_line(line)
-                        if parsed:
-                            tid, msg = parsed
-                            if not msg.strip():
-                                continue
-                            self._emit(msg, classify_line(msg), thread_id=tid)
-                        else:
-                            self._emit(line, classify_line(line), is_system=True)
-
-            except socket.timeout:
-                self._emit("Connection timed out", C_RED, is_system=True)
-            except ConnectionRefusedError:
-                self._emit(
-                    "Connection refused — is XBDM running?", C_RED, is_system=True
-                )
-            except ConnectionResetError:
-                self._emit("Connection reset by Xbox", C_RED, is_system=True)
-            except OSError as e:
-                if self.running:
-                    self._emit(f"Socket error: {e}", C_RED, is_system=True)
+                        self._dispatch_notification(line)
+            except (socket.timeout, ConnectionRefusedError,
+                    ConnectionResetError, OSError):
+                if self.running and not shown_error:
+                    self._emit("Connection lost, reconnecting...", C_YELLOW, is_system=True)
+                    shown_error = True
             finally:
                 self.connected = False
-                if self.sock:
+                if self.sock is not None:
                     try:
                         self.sock.close()
                     except Exception:
@@ -491,13 +931,9 @@ class XBDMConnection:
             if not self.running:
                 break
 
-            self._emit(
-                f"Reconnecting in {RECONNECT_DELAY}s...", C_YELLOW, is_system=True
-            )
-            for _ in range(RECONNECT_DELAY * 10):
-                if not self.running:
-                    return
-                time.sleep(0.1)
+            # XBDM persists our registration, so it will dial us back as
+            # soon as it is up again. Just loop to accept the next session.
+            time.sleep(RECONNECT_INTERVAL)
 
 
 # ── TUI Application ─────────────────────────────────────────────────────
@@ -598,6 +1034,16 @@ class XbMacsonTUI:
         curses.init_pair(C_HEADER, curses.COLOR_BLACK, curses.COLOR_GREEN)
         curses.init_pair(C_INPUT, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(C_SELECTED, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(C_BLUE, curses.COLOR_BLUE, -1)
+        # Thread color palette
+        thread_fg = [
+            curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+            curses.COLOR_MAGENTA, curses.COLOR_BLUE, curses.COLOR_RED,
+            curses.COLOR_WHITE,
+        ]
+        for i, fg in enumerate(thread_fg):
+            curses.init_pair(THREAD_COLORS_BASE + i, fg, -1)
+        self._thread_color_map = {}
         curses.curs_set(0)
         self.scr.nodelay(True)
         self.scr.keypad(True)
@@ -671,6 +1117,7 @@ class XbMacsonTUI:
         self.line_count = 0
         self.scroll_offset = 0
         self.auto_scroll = True
+        self._thread_color_map = {}
         self.mode = self.MONITOR
         self.conn.connect(ip)
         self._remember_ip(ip)
@@ -1008,33 +1455,33 @@ class XbMacsonTUI:
 
         # Header
         if self.conn.connected:
-            title = f"xbMacson \u2014 {self.conn.xbox_name or self.conn.xbox_ip}"
+            title = f"xbMacson: {self.conn.xbox_name or self.conn.xbox_ip}"
             if self.conn.xbox_name:
                 title += f" ({self.conn.xbox_ip})"
             if self.conn.dm_version:
-                title += f" \u2014 XBDM {self.conn.dm_version}"
+                title += f": XBDM {self.conn.dm_version}"
         else:
-            title = f"xbMacson \u2014 connecting to {self.conn.xbox_ip}..."
+            title = f"xbMacson: connecting to {self.conn.xbox_ip}..."
         self._header(title)
 
-        # Indicator row
+        # Indicator row: show active modes as pill-style badges
         inds = []
-        if self.filter_str:
-            inds.append(f"FILTER: {self.filter_str}")
         if self.raw_mode:
-            inds.append("RAW")
+            inds.append("\u25c9 RAW")
         if self.paused:
-            inds.append("PAUSED")
+            inds.append("\u23f8 PAUSED")
         if self.log_file:
-            inds.append(f"LOG: {self.log_filename}")
+            inds.append(f"\u25cf LOG: {self.log_filename}")
         if not self.auto_scroll:
-            inds.append("SCROLL LOCK")
+            inds.append("\u2191 SCROLL LOCK")
+        if self.filter_str:
+            inds.append(f"\u25b8 FILTER: {self.filter_str}")
         if self.screenshot_status:
-            inds.append(self.screenshot_status)
+            inds.append(f"\u25a3 {self.screenshot_status}")
 
         log_y = 1
         if inds:
-            self._addline(1, 1, " | ".join(inds), curses.color_pair(C_YELLOW) | curses.A_BOLD)
+            self._addline(1, 1, "  \u2502  ".join(inds), curses.color_pair(C_YELLOW) | curses.A_BOLD)
             log_y = 2
 
         # Log area
@@ -1056,38 +1503,56 @@ class XbMacsonTUI:
             if y >= h - 1:
                 break
 
-            # Timestamp
-            ts = f"[{ln.ts}]"
-            if ln.thread_id and not self.raw_mode:
-                pfx = f"{ts} [T{ln.thread_id}] "
+            x = 0
+            if self.raw_mode:
+                # Raw mode keeps the timestamp and the exact wire line.
+                ts = f"{ln.ts} "
+                self._addline(y, x, ts, curses.A_DIM)
+                x += len(ts)
+                rem = w - x - 1
+                if rem > 0:
+                    self._addline(y, x, ln.text, curses.color_pair(C_NORMAL), rem)
             else:
-                pfx = f"{ts} "
-
-            self._addline(y, 0, pfx, curses.A_DIM)
-
-            mx = len(pfx)
-            rem = w - mx - 1
-            if rem > 0:
+                # Match xbWatson: just the message text, colored. Timestamps
+                # and thread IDs stay in the log file, not on screen.
                 attr = curses.color_pair(ln.color)
                 if ln.is_system:
                     attr |= curses.A_BOLD
-                self._addline(y, mx, ln.text, attr, rem)
+                rem = w - x - 1
+                if rem > 0:
+                    self._addline(y, x, ln.text, attr, rem)
 
         # Status bar
-        left = f" Lines: {self.line_count}"
-        if self.filter_str:
-            left += f" | Visible: {len(visible)}"
-
-        connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
-        left = f" {connected_icon} {left.strip()}"
-
-        right = "B:Browse S:Screenshot F:Filter R:Raw L:Log P:Pause C:Clear I:Info X:Reboot Esc:Menu Q:Quit "
-        pad = w - len(left) - len(right)
-        if pad < 1:
-            bar = left[:w - 1]
+        if self.conn.stopped_thread is not None:
+            # Xbox is halted: show exception bar like xbWatson
+            reason = self.conn.stopped_reason
+            left = f" STOPPED: {reason} (thread {self.conn.stopped_thread})"
+            keys = "C:Continue  G:Go  X:Reboot  Q:Quit"
+            pad = w - len(left) - len(keys) - 1
+            if pad < 1:
+                bar = left[:w - 1]
+            else:
+                bar = left + " " * pad + keys + " "
+            # Draw in red to make it obvious
+            h_pos = h - 1
+            self.scr.attron(curses.color_pair(C_RED) | curses.A_BOLD | curses.A_REVERSE)
+            self.scr.addnstr(h_pos, 0, bar.ljust(w), w - 1)
+            self.scr.attroff(curses.color_pair(C_RED) | curses.A_BOLD | curses.A_REVERSE)
         else:
-            bar = left + " " * pad + right
-        self._status(bar)
+            connected_icon = "\u25cf" if self.conn.connected else "\u25cb"
+            conn_label = "LIVE" if self.conn.connected else "DISCONNECTED"
+            left = f" {connected_icon} {conn_label}"
+            left += f"  \u2502  {self.line_count} lines"
+            if self.filter_str:
+                left += f"  \u2502  filter: {self.filter_str} ({len(visible)} match)"
+
+            keys = "B:Browse S:Screenshot F:Filter R:Raw G:Go L:Log P:Pause C:Clear I:Info X:Reboot Esc:Menu Q:Quit"
+            pad = w - len(left) - len(keys) - 1
+            if pad < 1:
+                bar = left[:w - 1]
+            else:
+                bar = left + " " * pad + keys + " "
+            self._status(bar)
         self.scr.refresh()
 
     def _key_monitor(self):
@@ -1117,11 +1582,23 @@ class XbMacsonTUI:
             self.paused = not self.paused
 
         elif key in (ord("c"), ord("C")):
-            self.log_lines.clear()
-            self.line_count = 0
-            self.scroll_offset = 0
-            self.auto_scroll = True
-            self.screenshot_status = ""
+            if self.conn.stopped_thread is not None:
+                # Xbox is halted: Continue execution (like xbWatson)
+                threading.Thread(
+                    target=self.conn.continue_execution, daemon=True
+                ).start()
+            else:
+                self.log_lines.clear()
+                self.line_count = 0
+                self.scroll_offset = 0
+                self.auto_scroll = True
+                self.screenshot_status = ""
+
+        elif key in (ord("g"), ord("G")):
+            if self.conn.xbox_ip:
+                threading.Thread(
+                    target=self.conn.force_go, daemon=True
+                ).start()
 
         elif key in (ord("l"), ord("L")):
             self._toggle_log()
@@ -1138,9 +1615,13 @@ class XbMacsonTUI:
 
         elif key in (ord("x"), ord("X")):
             if self.conn.xbox_ip:
-                self._begin_confirm(
-                    "Reboot the Xbox?", self._do_reboot, self.MONITOR
-                )
+                if self.conn.stopped_thread is not None:
+                    # Xbox is halted: reboot immediately like xbWatson
+                    self._do_reboot()
+                else:
+                    self._begin_confirm(
+                        "Reboot the Xbox?", self._do_reboot, self.MONITOR
+                    )
 
         elif key in (ord("b"), ord("B")):
             if self.conn.xbox_ip:
@@ -1229,12 +1710,12 @@ class XbMacsonTUI:
             return
         self.msg_queue.put(
             LogLine(time.strftime("%H:%M:%S"), None,
-                    "Reboot command sent - Xbox restarting...",
+                    "Reboot command sent. Xbox is restarting...",
                     C_YELLOW, is_system=True)
         )
-        ip = self.conn.xbox_ip
-        self.conn.disconnect()
-        xbdm_query(ip, "REBOOT")
+        # Send REBOOT on a one-shot connection and leave the monitor thread
+        # running so it reconnects on its own once the box comes back up.
+        xbdm_query(self.conn.xbox_ip, "REBOOT")
 
     # ── Confirm Dialog ───────────────────────────────────────────────────
 
@@ -1330,7 +1811,7 @@ class XbMacsonTUI:
     def _draw_probe(self):
         self.scr.erase()
         h, w = self._size()
-        self._header(f"Xbox Info \u2014 {self.conn.xbox_ip}")
+        self._header(f"Xbox Info: {self.conn.xbox_ip}")
 
         y = 2
         for line in self.LOGO:
@@ -1488,7 +1969,7 @@ class XbMacsonTUI:
     def _draw_drives(self):
         self.scr.erase()
         h, w = self._size()
-        self._header(f"File Browser \u2014 {self.conn.xbox_ip}")
+        self._header(f"File Browser: {self.conn.xbox_ip}")
 
         y = 2
         for line in self.LOGO:
@@ -1569,7 +2050,7 @@ class XbMacsonTUI:
     def _draw_browser(self):
         self.scr.erase()
         h, w = self._size()
-        self._header(f"File Browser \u2014 {self.browser_path}")
+        self._header(f"File Browser: {self.browser_path}")
 
         y = 2
         for line in self.LOGO:
@@ -1654,7 +2135,7 @@ class XbMacsonTUI:
         elif self.browser_loading:
             return True
         else:
-            # Display list: ["..", *entries] — cursor 0 = parent
+            # Display list: ["..", *entries]: cursor 0 = parent
             nd = 1 + len(self.browser_entries)
             if key in (curses.KEY_UP, ord("k")):
                 self.browser_cursor = max(0, self.browser_cursor - 1)
@@ -1706,9 +2187,9 @@ class XbMacsonTUI:
                     f'Launching {full_path}...',
                     C_YELLOW, is_system=True)
         )
-        ip = self.conn.xbox_ip
-        self.conn.disconnect()
-        xbdm_query(ip, f'MAGICBOOT title="{full_path}" debug')
+        # Launch on a one-shot connection and keep the monitor running so it
+        # reconnects and catches the new title's startup output.
+        xbdm_query(self.conn.xbox_ip, f'MAGICBOOT title="{full_path}" debug')
         self.mode = self.MONITOR
 
 

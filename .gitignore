@@ -2,3 +2,6 @@
 *.pyc
 __pycache__/
 .xbmacson.json
+xbwatson.exe
+macson_orig.py
+.DS_Store
