@@ -1,54 +1,37 @@
 # xbMacson
 
-Cross-platform Xbox Debug Monitor for the original Xbox.
+Cross-platform debug monitor for the original Xbox, and now the Xbox 360.
 
-Connects to XBDM on port 731 and streams `OutputDebugString` / `DbgPrint` output in a terminal UI. Works on macOS, Linux, and Windows; pure Python 3 stdlib.
+It talks to XBDM: port 731 on the original Xbox, port 730 on the 360. You get
+a terminal UI that streams debug output the way xbWatson shows it, plus
+commands you can script: deploy, launch, screenshots, memory reads, a crash
+catcher with a symbolized stack, and a sampling profiler. Works on macOS,
+Linux and Windows. Pure Python 3 standard library.
 
-![Python 3.6+](https://img.shields.io/badge/python-3.6%2B-blue)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
-## Features
-
-- **Interactive TUI**: no flags to remember, everything is keyboard driven.
-- **Faithful xbWatson output**: debug strings, asserts, RIPs, exceptions and module loads, formatted the way xbWatson shows them. No on-screen timestamp or thread chrome by default.
-- **Survives resets and reboots**: clones xbWatson's `NOTIFYAT` reverse-connect model, so XBDM dials back automatically across in-game resets, hard reboots and XBE launches.
-- **Network scanner**: auto-discovers Xbox consoles on your local subnet.
-- **Live filtering**: type to filter debug output in real time.
-- **Color-coded output**: errors (red), warnings (yellow), init messages (green), tags (cyan).
-- **Raw mode**: toggle to see the wire output with timestamps.
-- **File logging**: timestamps and thread IDs preserved in the log file.
-- **Config file**: remembers your default Xbox, recent consoles, log directory.
-- **Screenshot capture**: dumps the Xbox framebuffer to PNG (pure stdlib, no PIL).
-- **File browser**: browse Xbox drives and directories, launch XBE files via `MAGICBOOT`.
-- **Probe mode**: query XBDM version, debug name, running XBE, loaded modules.
-- **Remote reboot**: reboot the Xbox from the monitor with confirmation.
-- **Zero dependencies**: pure Python stdlib (socket, curses, threading).
-
 ## Requirements
 
-- Python 3.6+
-- An original Xbox running a debug BIOS with XBDM enabled
-- Network connectivity to the Xbox (port 731/TCP)
-- On macOS: allow Python to accept incoming connections when prompted, so XBDM can dial back
+- Python 3.8 or newer
+- An original Xbox with a debug BIOS and XBDM, or an Xbox 360 devkit or
+  RGH console with XBDM
+- Network access to the console. On macOS, allow Python to accept incoming
+  connections when asked, so XBDM can dial back.
 
-> **Note:** The debug BIOS may assign a secondary IP address to the Xbox that differs from the dashboard IP. Use the network scanner to find it.
+The debug BIOS may give the Xbox a second IP address that differs from the
+dashboard one. The network scanner finds it.
 
-## Usage
+## Terminal UI
 
 ```bash
-# Launch the TUI
-python3 xbmacson.py
-
-# Quick-connect to a known IP
-python3 xbmacson.py 192.168.0.121
+python3 xbmacson.py                 # menu
+python3 xbmacson.py <console>       # connect right away
+python3 xbmacson.py tui <console> --profile x360
 ```
 
-No flags. The TUI handles everything.
-
-## TUI Controls
-
-### Main Menu
+### Main menu
 
 | Key | Action |
 |-----|--------|
@@ -57,93 +40,167 @@ No flags. The TUI handles everything.
 | `S` | Scan network |
 | `Q` | Quit |
 
-### Monitor View
+### Monitor
 
 | Key | Action |
 |-----|--------|
-| `B` | Browse filesystem (list drives, navigate directories, launch XBEs) |
-| `S` | Screenshot (capture framebuffer to PNG) |
-| `F` | Filter (live search as you type) |
-| `R` | Toggle raw mode (show unparsed XBDM output with timestamps) |
-| `L` | Toggle file logging |
-| `P` | Pause / resume output |
-| `C` | Clear screen |
-| `I` | Probe Xbox info (version, modules, running XBE) |
-| `X` | Reboot Xbox (with confirmation) |
-| `D` | Set current Xbox as default |
-| `Up/Down` | Scroll through history |
-| `PgUp/PgDn` | Scroll by page |
-| `Home/End` | Jump to top / bottom |
-| `Esc` | Back to menu (connection stays alive) |
+| `B` | Browse files (drives, directories, launch XBEs) |
+| `S` | Screenshot to PNG |
+| `F` | Filter as you type |
+| `R` | Raw mode (wire lines with timestamps) |
+| `L` | Log to file |
+| `P` | Pause / resume |
+| `C` | Clear screen, or Continue when the console is stopped |
+| `G` | Go (resume, even if the monitor missed the stop) |
+| `I` | Console info |
+| `X` | Reboot (asks first unless the console is stopped) |
+| `D` | Make this console the default |
+| `Up/Down`, `PgUp/PgDn`, `Home/End` | Scroll |
+| `Esc` | Back to the menu (connection stays up) |
 | `Q` | Quit |
 
-### File Browser
+### File browser
 
 | Key | Action |
 |-----|--------|
-| `Up/Down` | Navigate entries |
-| `Enter` | Open directory or launch XBE (with confirmation) |
-| `Backspace` | Go up one directory |
-| `R` | Refresh current directory |
-| `Esc` | Back to drives / monitor |
+| `Up/Down` | Navigate |
+| `Enter` | Open a directory, or launch an XBE (asks first) |
+| `Backspace` | Up one directory |
+| `R` | Refresh |
+| `Esc` | Back to drives |
 
-### Filter Mode
+### Filter
 
 | Key | Action |
 |-----|--------|
-| Type | Live filter as you type |
-| `Enter` | Confirm filter |
-| `Esc` | Cancel and clear filter |
+| Type | Filter live |
+| `Enter` | Keep the filter |
+| `Esc` | Cancel |
+
+## Commands
+
+```bash
+python3 xbmacson.py <command> --console <console> [options]
+python3 -m xbmacson <command> ...
+```
+
+`--console` takes `<console>` or `<console>:<port>`. Without it, the
+`XBMACSON_CONSOLE` variable or `default_ip` from the config is used.
+`--profile x360` switches to the Xbox 360 (port 730). `--json` gives JSON
+where it makes sense.
+
+| Command | What it does |
+|---------|--------------|
+| `info` | Name, XBDM version, running title, modules, threads |
+| `log` | Print debug output. `--file`, `--raw`, `--timestamps`, `--until REGEX`, `--duration S` |
+| `deploy <local> <remote>` | Upload. If the running title holds the file, reboot and retry. `--launch`, `--no-reboot` |
+| `get <remote> <local>` | Download |
+| `launch <path>` | Boot an XBE or XEX |
+| `screenshot [out]` | Save the framebuffer as PNG (360 frames are untiled) |
+| `threads` | List threads. `--context --map FILE` shows where each one is |
+| `mem <addr> <len>` | Hex dump, or `--out FILE` |
+| `modules`, `ls [path]` | Modules; drives or a directory |
+| `crash --map FILE` | Wait for a crash, print registers and the stack as function+offset |
+| `profile --map FILE` | Sample thread pcs and rank functions |
+| `reboot`, `go` | Reboot; resume after a stop |
+| `scan` | Find consoles on the local network |
+| `cmd "<raw>"` | Send one XBDM command |
+
+Exit codes: 0 ok, 1 the console refused or the operation failed, 2 bad
+arguments, 3 cannot connect, 4 timed out (`log --until`, `crash --wait`),
+130 interrupted.
+
+Examples:
+
+```bash
+# Deploy, launch, and wait for the title to say it is up
+python3 xbmacson.py deploy --console <console> build/xbox/default.xbe 'E:\games\halo\default.xbe' --launch
+python3 xbmacson.py log --console <console> --until 'main menu' --duration 120
+
+# Catch the next crash and name the frames
+python3 xbmacson.py crash --console <console> --map build/xbox/halo.map
+
+# Where does thread 28 spend its time?
+python3 xbmacson.py profile --console <console> --map build/xbox/halo.map --thread 28 --seconds 10
+```
+
+`crash` and `profile` are explained in [docs/profiling.md](docs/profiling.md),
+including what sampling costs the console.
 
 ## Configuration
 
-Config is stored at `~/.xbmacson.json` and managed through the Settings menu. You can also edit it directly:
+`~/.xbmacson.json`, edited from the Settings menu or by hand. Files from
+earlier versions keep working.
 
 ```json
 {
-  "default_ip": "192.168.0.121",
+  "default_ip": "<console>",
   "auto_reconnect": true,
   "default_logging": false,
   "log_dir": "",
   "screenshot_dir": "~/Desktop/xbox_screenshots",
-  "last_connected": [
-    ["192.168.0.121", "milenko"]
-  ]
+  "last_connected": []
 }
 ```
 
-A sample config is included as `config.sample.json`.
+| Setting | Meaning |
+|---------|---------|
+| `default_ip` | Console offered first in the menu, and the default for commands |
+| `auto_reconnect` | Keep listening after the console drops (default true) |
+| `default_logging` | Start logging on connect |
+| `log_dir` | Where log files go (default: current directory) |
+| `screenshot_dir` | Where screenshots go |
+| `last_connected` | Recent consoles, kept for you |
 
-| Setting | Description |
-|---------|-------------|
-| `default_ip` | Xbox IP shown as the first menu option for quick-connect |
-| `auto_reconnect` | Automatically reconnect on disconnect (default: true) |
-| `default_logging` | Start logging automatically on connect (default: false) |
-| `log_dir` | Directory for log files (default: current directory) |
-| `screenshot_dir` | Directory for screenshot PNGs (default: `~/Desktop/xbox_screenshots`) |
-| `last_connected` | Recent consoles (managed automatically) |
+## How it works
 
-## How It Works
+xbMacson does what xbWatson does for notifications. It listens on a local
+port and sends `debugger connect` and `notifyat port=<port>`. XBDM dials
+back and pushes debug strings, asserts, RIPs, exceptions and module loads.
+XBDM keeps the registration across resets, reboots and title launches, so
+xbMacson simply waits for the next dial-in. On exit it sends `notifyat
+port=<port> drop`. The 360 profile uses `notify` on one connection instead,
+as OXDK's tool does; `--channel` picks either.
 
-xbMacson clones xbWatson's notification model rather than running its own polling loop:
+Everything else (files, screenshots, launch, reboot) goes over a separate
+command connection, so it never disturbs the notification channel.
 
-1. Binds a local TCP listen socket on a free port.
-2. Connects to the Xbox on port 731, sends `DEBUGGER connect` and `NOTIFYAT port=<local-port>` to register.
-3. XBDM stores the registration in its `.ini` and dials back to the listen socket. That accepted connection is the notification channel.
-4. xbMacson reads `debugstr`, `assert`, `rip`, `exception`, `modload` and the other notifications off the channel and renders them.
-5. When the connection drops (in-game reset, reboot, XBE launch), the listen socket waits for the next dial-in. XBDM reconnects on its own once it is back up, because the registration is persistent.
-6. On clean exit, xbMacson sends `notifyat port=<port> drop` so the Xbox stops calling a port we are no longer listening on.
+The protocol pieces used, and where they are documented, are in
+[docs/protocol.md](docs/protocol.md).
 
-Screenshots, file browsing, reboot and XBE launch all use separate one-shot connections so they do not interfere with the persistent notification channel. The file browser uses `DRIVELIST` and `DIRLIST` to enumerate, and `MAGICBOOT` to cold-boot into an XBE.
+## Layout
 
-TCP keepalive is enabled on the notification socket so a rebooting Xbox that drops the link without a clean close is detected in seconds rather than the OS default.
+```
+xbmacson.py           launcher (TUI or commands)
+xbmacson/
+  connection.py       one XBDM connection, reply codes, binary framing
+  client.py           typed commands: threads, context, memory, files, launch ...
+  notify.py           notification parsing, xbWatson formatting, listener
+  profiles.py         original Xbox and Xbox 360 differences
+  screenshot.py       framebuffer decoding, PNG writer
+  symbols.py          map file reader
+  stack.py            ebp chain and stack scan
+  sampler.py          profiler
+  cli.py, tui.py      the two front ends
+tests/                fake XBDM server and tests
+```
+
+Run the tests with `python3 -m unittest discover -s tests`. They use a fake
+XBDM server on 127.0.0.1 and never touch a real console.
 
 ## Background
 
-[xbWatson](https://xboxdevwiki.net/XBDM) was the original Xbox Debug Monitor client, but it only runs on Windows (and really only on XP-era machines with the XDK installed). xbMacson does the same job on any platform, with a modern terminal UI.
+[xbWatson](https://xboxdevwiki.net/Xbox_Debug_Monitor) was the original Xbox
+debug monitor, but it only runs on Windows (and really only on XP-era
+machines with the XDK installed). xbMacson does the same job on any
+platform, with a modern terminal UI.
 
-Named as a nod to the original, with a Mac twist because Milenko is a bougie bitch.
+Named as a nod to the original, with a Mac twist because Milenko is a bougie
+bitch.
+
+The Xbox 360 client and its screenshot untiling come from
+[OXDK](https://github.com/Horrible-Dev/OXDK) (public domain).
 
 ## License
 
-MIT
+MIT. Copyright (c) 2026 Milenko.

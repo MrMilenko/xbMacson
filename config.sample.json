@@ -1,5 +1,5 @@
 {
-  "default_ip": "192.168.0.121",
+  "default_ip": "<console>",
   "auto_reconnect": true,
   "log_dir": "",
   "last_connected": []
