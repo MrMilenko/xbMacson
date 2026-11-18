@@ -1,0 +1,24 @@
+ sample
+
+ Timestamp is 6af8a121 (Sat Nov 14 12:57:53 2026)
+
+ Preferred load address is 0000000000010000
+
+ Start         Length     Name                   Class
+ 0001:00000000 00001000H .text                   CODE
+ 0002:00000000 00000100H .rdata                  DATA
+ 0003:00000000 00000100H .data                   DATA
+
+  Address         Publics by Value              Rva+Base               Lib:Object
+
+ 0000:00000000       __except_list              0000000000000000     <absolute>
+ 0001:00000000       _main_loop                 0000000000011000     main.c.obj
+ 0001:00000000       .bf                        0000000000011000     main.c.obj
+ 0001:00000100       _game_tick@4               0000000000011100     game.c.obj
+ 0001:00000200       _player_update             0000000000011200     player.c.obj
+ 0001:00000300       @fast_math@8               0000000000011300     math.c.obj
+ 0001:00000400       ?render@Scene@@QAEXXZ      0000000000011400     render.cpp.obj
+ 0001:00000480       $loop$123                  0000000000011480     render.cpp.obj
+ 0001:00001004       _ExThunk@4                 0000000000012004     xboxkrnl:xboxkrnl.exe
+ 0002:00000000       _g_table                   0000000000013000     data.c.obj
+ 0003:00000010       _g_state                   0000000000014010     data.c.obj
